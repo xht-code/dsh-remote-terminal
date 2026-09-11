@@ -5,10 +5,15 @@
  * 宿主 Web 服务器上：浏览器客户端经认证后 attach 会话，输入/resize 上行、
  * 输出/退出事件下行。会话独立于浏览器连接保活，刷新页面后可重新接入。
  *
- * 路由与会话表放在 Symbol.for 全局共享状态上按引用计数持有：cordis 热重载
- * 的窗口期是"新 fiber 先 apply、旧 fiber 后卸载"，若路由注册绑死单一 fiber
- * 生命周期，旧卸载会与重复注册抛错相撞；引用计数让两端在窗口期共享同一层，
- * 最后一个 fiber 卸载时才销毁路由并清杀全部 PTY。
+ * 路由与会话表放在 Symbol.for 全局共享状态上按引用计数持有：同一装配若出现两个
+ * fiber 并存的窗口期（例如同一插件被挂载两次），路由重复注册会与旧卸载撞车；
+ * 引用计数让两端共享同一层，最后一个 fiber 卸载时才销毁路由并清杀全部 PTY。
+ *
+ * 注意这个窗口与下面的具名服务注册互斥：`ctx.reflect.provide` 对同名服务是硬冲突，
+ * 只有旧 fiber 先释放名字，新 fiber 才注册得上。实测 DSH 的两条重载路径都是旧先新
+ * （cordis-plugin-loader 先 dispose 再 start；cordis-plugin-hmr 先 registry.delete
+ * 再重新挂载），因此正常热重载不会触发；一旦真出现并存窗口，本模块的 apply 会直接
+ * 抛错（并归还自己那份引用），而不是让两个 fiber 同时代表共享层。
  *
  * @module dsh-remote-terminal
  */
@@ -19,6 +24,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import type { IncomingMessage } from 'node:http'
+import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import z from '@deepseek-ai/schemastery'
@@ -26,7 +32,7 @@ import { spawn as spawnPty } from 'node-pty'
 import type { IPty } from 'node-pty'
 import { WebSocketServer } from 'ws'
 import type { WebSocket } from 'ws'
-import type { ClientMessage, ServerMessage } from './protocol.ts'
+import type { ClientMessage, ServerMessage, SessionSummary } from './protocol.ts'
 import { DEFAULT_SCOPE, MAX_COLS, MAX_FRAME_BYTES, MAX_ROWS, MIN_COLS, MIN_ROWS, parseClientMessage } from './protocol.ts'
 
 /** 插件名（同时作为 Cordis 插件 id）。 */
@@ -34,6 +40,16 @@ export const name = 'dsh-remote-terminal'
 
 /** 声明依赖的服务：Web 服务器提供升级路由，Connection 提供握手认证。 */
 export const inject = ['webServer', 'connection'] as const
+
+/** 对外暴露的终端会话服务名（`ctx.terminalSessions`）。 */
+export const TERMINAL_SESSIONS_SERVICE = 'terminalSessions'
+
+/**
+ * 作用域键的构造与缺省值：`ctx.terminalSessions.create({ scope })` 必须传这套键，
+ * 否则会话会落进别的桶、终端视图对账时看不见它。两端共用同一套键，故从宿主入口
+ * 一并导出，调用方不必自己拼 `workspace:` 前缀。
+ */
+export { DEFAULT_SCOPE, workspaceScope } from './protocol.ts'
 
 /** 插件配置。全部字段可选；运行时经 {@link resolveConfig} 补齐默认值。 */
 export interface Config {
@@ -141,6 +157,13 @@ interface TerminalSession {
   clients: Set<WebSocket>
   /** 最近一次挂接集合清空的时刻（新建时视为空闲）：配额吃紧时据此回收孤儿会话。 */
   idleSince: number
+  /** 来源标签（如「预览 p4271」）：由创建方指定，用于终端标签的显示名。 */
+  label: string | undefined
+  /**
+   * 是否由别的插件（预览页签）拉起：这类进程占用的是预览自己的配额，
+   * 不计入用户手工终端的 maxSessions，否则预览开的服务会把终端额度吃光。
+   */
+  external: boolean
 }
 
 /** 每个 WebSocket 连接的挂接状态：一个连接可同时挂接多个会话。 */
@@ -165,6 +188,11 @@ interface SharedState {
 }
 
 const sharedStateKey = Symbol.for('dsh-remote-terminal.shared-state')
+
+/** 共享运行层所在的全局槽位（`Symbol.for` 保证跨热重载的模块实例看到同一层）。 */
+function sharedStateSlot(): Record<PropertyKey, SharedState | undefined> {
+  return globalThis as unknown as Record<PropertyKey, SharedState | undefined>
+}
 
 /** 全局连接表：close 事件与心跳需要按连接反查挂接状态。 */
 const connectedClients = new WeakMap<WebSocket, ClientState>()
@@ -210,8 +238,8 @@ function info(state: SharedState, message: string): void {
  * @returns 共享运行层。
  */
 function acquireSharedState(ctx: Context, config: ResolvedConfig): SharedState {
-  const globals = globalThis as unknown as Record<PropertyKey, SharedState | undefined>
-  let state = globals[sharedStateKey]
+  const slot = sharedStateSlot()
+  let state = slot[sharedStateKey]
   if (state === undefined) {
     state = {
       ctx,
@@ -223,7 +251,7 @@ function acquireSharedState(ctx: Context, config: ResolvedConfig): SharedState {
       bashRcDir: undefined,
       heartbeat: undefined,
     }
-    globals[sharedStateKey] = state
+    slot[sharedStateKey] = state
     installConnectionHandlers(state)
     state.heartbeat = startHeartbeat(state)
   }
@@ -239,9 +267,12 @@ function acquireSharedState(ctx: Context, config: ResolvedConfig): SharedState {
  * 释放当前 fiber 的引用；引用归零时销毁升级路由、断开全部连接并清杀
  * 全部 PTY 会话。
  *
+ * 导出仅为让 `scripts/verify-host.mjs` 能断言「同一装配被重复挂载、注册失败时也要
+ * 归还引用」这条不变式；生产路径只有 {@link apply} 的 teardown 会调用它。
+ *
  * @param state - 共享运行层。
  */
-function releaseSharedState(state: SharedState): void {
+export function releaseSharedState(state: SharedState): void {
   state.refs -= 1
   if (state.refs > 0) return
   state.routeDisposer?.()
@@ -264,8 +295,8 @@ function releaseSharedState(state: SharedState): void {
     }
     state.bashRcDir = undefined
   }
-  const globals = globalThis as unknown as Record<PropertyKey, SharedState | undefined>
-  if (globals[sharedStateKey] === state) delete globals[sharedStateKey]
+  const slot = sharedStateSlot()
+  if (slot[sharedStateKey] === state) delete slot[sharedStateKey]
 }
 
 /**
@@ -409,7 +440,33 @@ function handleClientMessage(state: SharedState, ws: WebSocket, client: ClientSt
       disposeSession(state, message.terminalId)
       break
     }
+    case 'list': {
+      sendServerMessage(state, ws, {
+        type: 'sessions',
+        sessions: listSessions(state),
+        ...(message.token === undefined ? {} : { token: message.token }),
+      })
+      break
+    }
   }
+}
+
+/**
+ * 列出宿主当前的全部会话摘要。
+ *
+ * 客户端在连接就绪后请求一次，用来发现**不是自己创建**的会话——例如
+ * `dsh-local-preview` 从「预览」页签拉起的服务进程——然后逐个 attach，
+ * 使它们以普通终端标签出现。摘要只给对账需要的身份（会话 id + 所属作用域），
+ * 标签名与退出状态由 attach 应答给出。
+ *
+ * @param state - 共享运行层。
+ * @returns 按创建顺序排列的会话摘要。
+ */
+export function listSessions(state: SharedState): SessionSummary[] {
+  return [...state.sessions.values()].map(session => ({
+    terminalId: session.id,
+    scope: session.scope,
+  }))
 }
 
 /**
@@ -524,10 +581,13 @@ async function handleAttach(
     return
   }
 
-  // 配额分两层：先按作用域（工作区）判定，再用跨工作区的总数上限兜底。
+  // 配额分两层：先按作用域（工作区）判定，再用跨工作区的总数上限兜底。手工终端的
+  // 配额只管手工终端：external 会话（别的插件拉起的长驻进程）既不占分子，也不能
+  // 被这条路径回收——让不占额度的会话去偿还额度，等于把别人的 dev server 杀掉。
   const scope = message.scope ?? DEFAULT_SCOPE
-  evictExitedSessions(state, scope)
-  if (sessionsInScope(state, scope).length >= state.config.maxSessions && !reclaimIdleSession(state, scope)) {
+  evictExitedSessions(state, scope, false)
+  if (sessionsInScope(state, scope, false).length >= state.config.maxSessions
+    && !reclaimIdleSession(state, scope, false)) {
     sendServerMessage(state, ws, {
       type: 'error',
       message: '本工作区的终端会话数已达上限（' + state.config.maxSessions + '），且全部会话都在使用中，请先关闭一个终端',
@@ -548,7 +608,12 @@ async function handleAttach(
     }
   }
 
-  const session = createSession(state, scope, cwd, clamp(message.cols ?? 80, MIN_COLS, MAX_COLS), clamp(message.rows ?? 24, MIN_ROWS, MAX_ROWS))
+  const session = createSession(state, {
+    scope,
+    cwd,
+    cols: clamp(message.cols ?? 80, MIN_COLS, MAX_COLS),
+    rows: clamp(message.rows ?? 24, MIN_ROWS, MAX_ROWS),
+  })
   state.sessions.set(session.id, session)
   info(state, '已创建终端会话 ' + session.id + '（scope=' + scope + '，cwd=' + session.cwd + '）')
   attachClient(state, session, ws, client, message.token)
@@ -580,19 +645,23 @@ async function resolveCwd(state: SharedState, requested: string | undefined): Pr
  * @param scope - 作用域键。
  * @returns 该作用域内的会话列表。
  */
-function sessionsInScope(state: SharedState, scope: string): TerminalSession[] {
-  return [...state.sessions.values()].filter(session => session.scope === scope)
+function sessionsInScope(state: SharedState, scope: string, includeExternal = true): TerminalSession[] {
+  return [...state.sessions.values()].filter(session =>
+    session.scope === scope && (includeExternal || !session.external))
 }
 
 /**
- * 回收已退出且无人挂接的会话，为新建会话腾出配额。
+ * 回收已退出且无人挂接的会话，为新建会话腾出配额（不触碰 PTY：进程已经结束）。
  *
  * @param state - 共享运行层。
  * @param scope - 限定作用域；缺省表示跨全部工作区（总数上限兜底时用）。
+ * @param includeExternal - 是否连 external 会话一起清；手工配额路径传 false，
+ * 否则会把另一个插件还没来得及读取的退出码一并抹掉。
  */
-function evictExitedSessions(state: SharedState, scope?: string): void {
+function evictExitedSessions(state: SharedState, scope?: string, includeExternal = true): void {
   for (const [id, session] of state.sessions) {
     if (scope !== undefined && session.scope !== scope) continue
+    if (!includeExternal && session.external) continue
     if (session.exited && session.clients.size === 0) state.sessions.delete(id)
   }
 }
@@ -606,12 +675,17 @@ function evictExitedSessions(state: SharedState, scope?: string): void {
  *
  * @param state - 共享运行层。
  * @param scope - 限定作用域；缺省表示跨全部工作区（总数上限兜底时用）。
+ * @param includeExternal - 是否把 external 会话也当作回收候选；手工配额路径传
+ * false，只回收手工终端——external 不占该额度，就不能被它回收。总数兜底路径
+ * 传 true，接受「可能回收掉别人的长驻进程」这一代价（持有方只能靠 `describe()`
+ * 发现会话已消失）。
  * @returns 是否回收成功；候选范围内全部会话都在使用中时为 false。
  */
-function reclaimIdleSession(state: SharedState, scope?: string): boolean {
+function reclaimIdleSession(state: SharedState, scope?: string, includeExternal = true): boolean {
   let victim: TerminalSession | undefined
   for (const session of state.sessions.values()) {
     if (scope !== undefined && session.scope !== scope) continue
+    if (!includeExternal && session.external) continue
     if (session.clients.size > 0) continue
     if (victim === undefined || session.idleSince < victim.idleSince) victim = session
   }
@@ -664,45 +738,75 @@ function ensureBashRc(state: SharedState): string | undefined {
   }
 }
 
+/** 创建一个终端会话的请求（交互式 shell 与外部拉起的进程共用）。 */
+interface SpawnSessionRequest {
+  /** 所属作用域（工作区）：maxSessions 配额按它分别计算。 */
+  scope: string
+  /** 已校验的工作目录。 */
+  cwd: string
+  /** 初始列数。 */
+  cols: number
+  /** 初始行数。 */
+  rows: number
+  /** 要运行的可执行文件；缺省即配置里的交互式 shell。 */
+  command?: string
+  /** 可执行文件的参数；传了 `command` 时缺省为空数组，不继承 shell 的交互式参数。 */
+  args?: string[]
+  /** 额外环境变量，叠加在脱敏父环境之上（`DSH_*` 不在其中，需由调用方显式给出）。 */
+  env?: Record<string, string>
+  /** 来源标签（如「预览 p4271」），显示为终端标签名。 */
+  label?: string
+  /** 由别的插件拉起：不计入手工终端的配额。 */
+  external?: boolean
+}
+
 /**
  * 创建并挂载一个 PTY 会话：spawn 后立即接线输出与退出事件，返回
  * 尚未写入会话表的会话对象（发布由调用方完成）。
  *
+ * 传了 `command` 时不套 bash rc 包装：包装只为交互式 shell 的提示符钩子存在，
+ * 拉起的业务进程（dev server 等）不需要、也不该继承那套 `-i` 语义。
+ *
  * @param state - 共享运行层。
- * @param scope - 会话所属作用域（工作区）。
- * @param cwd - 已校验的初始工作目录。
- * @param cols - 初始列数。
- * @param rows - 初始行数。
+ * @param request - 会话参数。
  * @returns 新会话。
  */
-function createSession(state: SharedState, scope: string, cwd: string, cols: number, rows: number): TerminalSession {
-  let shellPath = state.config.shellPath
-  let shellArgs = state.config.shellArgs
-  if (state.config.injectBashRc) {
+function createSession(state: SharedState, request: SpawnSessionRequest): TerminalSession {
+  const runsCommand = request.command !== undefined
+  const file = request.command ?? state.config.shellPath
+  // 拉起外部命令时不继承 shellArgs：那批参数是交互式 shell 的语义（POSIX 的
+  // `-i`、Windows 的 `-NoLogo -NoProfile`），塞给业务进程会让 `pnpm dev` 变成
+  // `pnpm dev -i`。
+  let args = request.args ?? (runsCommand ? [] : state.config.shellArgs)
+  if (!runsCommand && state.config.injectBashRc) {
     const rcPath = ensureBashRc(state)
-    if (rcPath !== undefined) shellArgs = ['--rcfile', rcPath, ...shellArgs]
+    if (rcPath !== undefined) args = ['--rcfile', rcPath, ...args]
   }
   // id 先于 spawn 分配：id 分配是唯一会在 spawn 之后抛出的步骤，放在前面才不会
   // 留下没人持有、也没人杀得掉的 PTY。
   const id = createSessionId(state)
-  const pty = spawnPty(shellPath, shellArgs, {
+  const pty = spawnPty(file, args, {
     name: 'xterm-256color',
-    cols,
-    rows,
-    cwd,
-    env: scrubbedParentEnv(),
+    cols: request.cols,
+    rows: request.rows,
+    cwd: request.cwd,
+    // 脱敏父环境（剔除凭据类与全部 DSH_*）：终端不继承 agent shell 的会话事实，
+    // 需要 DSH_* 的值请走 create({ env }) 注入，或在 shell 里自己显式 export。
+    env: { ...scrubbedParentEnv(), ...request.env },
   })
   const session: TerminalSession = {
     id,
     pty,
-    cwd,
-    scope,
+    cwd: request.cwd,
+    scope: request.scope,
     exited: false,
     exitCode: null,
     scrollback: [],
     scrollbackBytes: 0,
     clients: new Set(),
     idleSince: Date.now(),
+    label: request.label,
+    external: request.external === true,
   }
   pty.onData((chunk) => {
     appendScrollback(state, session, chunk)
@@ -751,6 +855,7 @@ function attachClient(state: SharedState, session: TerminalSession, ws: WebSocke
     cwd: session.cwd,
     exited: session.exited,
     exitCode: session.exitCode,
+    ...(session.label === undefined ? {} : { label: session.label }),
     ...(token === undefined ? {} : { token }),
   })
   if (session.scrollback.length > 0) {
@@ -805,6 +910,147 @@ function disposeSession(state: SharedState, sessionId: string): void {
   info(state, '终端会话 ' + sessionId + ' 已销毁')
 }
 
+/** 由别的插件拉起的进程的创建请求。 */
+export interface ExternalSpawnRequest {
+  /** 要运行的可执行文件。 */
+  command: string
+  /** 可执行文件的参数。 */
+  args?: string[]
+  /** 工作目录；缺省为用户主目录。 */
+  cwd?: string
+  /**
+   * 额外环境变量，叠加在脱敏父环境之上；也是 `DSH_*` 事实进入进程的唯一通道
+   * （脱敏父环境剔除全部 `DSH_*`）。预览用它注入 `DSH_PREVIEW_BASE`。
+   */
+  env?: Record<string, string>
+  /** 来源标签（如「预览 p4271」），显示为终端标签名。 */
+  label?: string
+  /** 所属作用域（工作区）；缺省归入 default 桶。 */
+  scope?: string
+  /** 初始列数。 */
+  cols?: number
+  /** 初始行数。 */
+  rows?: number
+}
+
+/**
+ * 拉起一个由别的插件持有的会话。
+ *
+ * 与浏览器 attach 新建的终端走同一条 `createSession` 路径，因此它会出现在
+ * `listSessions()` 里，终端视图对账后自动 attach——「预览」页签拉起的 dev server
+ * 于是就是一个普通终端标签，可看日志、可输入、可 Ctrl-C。
+ *
+ * 这类会话标记为 `external`：它占用的是调用方自己的配额，不计入手工终端的
+ * `maxSessions`，否则预览开几个服务就会把用户的终端额度吃光。
+ *
+ * @param state - 共享运行层。
+ * @param request - 创建参数。
+ * @returns 新会话 id。
+ * @throws 工作目录不可用时抛出，调用方据此回显原因。
+ */
+export async function spawnExternalSession(state: SharedState, request: ExternalSpawnRequest): Promise<string> {
+  const cwd = await resolveCwd(state, request.cwd)
+  if (cwd === undefined) throw new Error('工作目录不可用：' + (request.cwd ?? homedir()))
+  if (state.sessions.size >= state.config.maxSessionsTotal) {
+    evictExitedSessions(state)
+    if (state.sessions.size >= state.config.maxSessionsTotal && !reclaimIdleSession(state)) {
+      throw new Error('终端会话总数已达上限（' + state.config.maxSessionsTotal + '），无法拉起新进程')
+    }
+  }
+  const session = createSession(state, {
+    scope: request.scope ?? DEFAULT_SCOPE,
+    cwd,
+    cols: clamp(request.cols ?? 120, MIN_COLS, MAX_COLS),
+    rows: clamp(request.rows ?? 30, MIN_ROWS, MAX_ROWS),
+    command: request.command,
+    ...(request.args === undefined ? {} : { args: request.args }),
+    ...(request.env === undefined ? {} : { env: request.env }),
+    ...(request.label === undefined ? {} : { label: request.label }),
+    external: true,
+  })
+  state.sessions.set(session.id, session)
+  info(state, '已拉起外部会话 ' + session.id + '（' + request.command + '，cwd=' + cwd + '）')
+  return session.id
+}
+
+/**
+ * 关闭一个外部会话（已退出的会话只做清理，不重复广播）。
+ *
+ * @param state - 共享运行层。
+ * @param sessionId - 目标会话 id。
+ * @returns 确实关闭了一个未退出的会话时为 true。
+ */
+export function closeExternalSession(state: SharedState, sessionId: string): boolean {
+  const session = state.sessions.get(sessionId)
+  if (session === undefined) return false
+  const wasRunning = !session.exited
+  disposeSession(state, sessionId)
+  return wasRunning
+}
+
+/**
+ * 宿主对外暴露的终端会话入口。
+ *
+ * 注册为 `ctx.terminalSessions`，由别的插件（如 `dsh-local-preview`）在需要把
+ * 一个长驻进程放到终端里时使用；本包自己不再多一份进程管理。
+ */
+export class TerminalSessionsService extends Service {
+  private readonly sessions: SharedState
+
+  /**
+   * 注册服务。
+   *
+   * @param ctx - 宿主上下文（服务随该 fiber 卸载）。
+   * @param sessions - 跨热重载共享的运行层。
+   */
+  constructor(ctx: Context, sessions: SharedState) {
+    super(ctx, TERMINAL_SESSIONS_SERVICE)
+    this.sessions = sessions
+  }
+
+  /**
+   * 拉起一个长驻进程并把它登记为终端会话。
+   *
+   * @param request - 创建参数。
+   * @returns 新会话 id，可直接用于关闭或让前端 attach。
+   */
+  async create(request: ExternalSpawnRequest): Promise<string> {
+    return await spawnExternalSession(this.sessions, request)
+  }
+
+  /**
+   * 关闭一个本服务拉起的会话。
+   *
+   * @param sessionId - 目标会话 id。
+   * @returns 关掉了一个仍在运行的会话时为 true；会话不存在或已退出为 false。
+   */
+  close(sessionId: string): boolean {
+    return closeExternalSession(this.sessions, sessionId)
+  }
+
+  /**
+   * 读一个会话的当前状态。
+   *
+   * @param sessionId - 目标会话 id。
+   * @returns 是否已退出与退出码；会话不存在（已被销毁或从未存在）时为 undefined。
+   */
+  describe(sessionId: string): { exited: boolean; exitCode: number | null } | undefined {
+    const session = this.sessions.sessions.get(sessionId)
+    if (session === undefined) return undefined
+    return { exited: session.exited, exitCode: session.exitCode }
+  }
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /**
+     * 终端会话服务（由本插件注册）。消费方 `import` 本包任意导出即带上这条声明；
+     * 只用到服务时写 `import type {} from 'dsh-remote-terminal'` 即可。
+     */
+    terminalSessions: TerminalSessionsService
+  }
+}
+
 /**
  * 安装插件：获取共享运行层并把生命周期计入引用。
  *
@@ -812,7 +1058,27 @@ function disposeSession(state: SharedState, sessionId: string): void {
  * @param config - 插件配置。
  */
 export function apply(ctx: Context, config: Config = {}): void {
+  // 装配失败时新 fiber 无权代表共享层，要把上下文交还给失败前的持有者。这里存的
+  // 必须是当时的值：acquireSharedState 会就地覆写共享层自己的 ctx/config，存对象
+  // 引用会把覆写后的结果读回来。
+  const existing = sharedStateSlot()[sharedStateKey]
+  const previousOwner = existing === undefined ? undefined : { ctx: existing.ctx, config: existing.config }
   const state = acquireSharedState(ctx, resolveConfig(config))
+  try {
+    // 对外服务：别的插件用它把长驻进程放进终端（服务随本 fiber 卸载而注销）。
+    new TerminalSessionsService(ctx, state)
+  } catch (error) {
+    // 装配失败就没有 fiber 会来卸载，抢在抛错前把这层的引用还掉：否则共享运行层
+    // 的引用计数永远不归零，升级路由、心跳与全部 PTY 会活到进程结束。
+    releaseSharedState(state)
+    // 引用归零时共享层已随之销毁；仍被前一个持有者持有才需要交还 ctx/config，
+    // 否则那层会拿着一个已失效的 fiber 发日志、做握手判定。
+    if (previousOwner !== undefined) {
+      state.ctx = previousOwner.ctx
+      state.config = previousOwner.config
+    }
+    throw error
+  }
   ctx.effect(() => () => {
     releaseSharedState(state)
   }, name + ': teardown')

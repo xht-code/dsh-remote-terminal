@@ -29,6 +29,28 @@ export type ClientMessage =
   | { type: 'input'; terminalId: string; data: string }
   | { type: 'resize'; terminalId: string; cols: number; rows: number }
   | { type: 'close'; terminalId: string }
+  | {
+      /**
+       * 列出宿主当前的会话快照。视图在每次连接就绪后请求一次，用来发现**不是
+       * 自己创建**的会话（例如 dsh-local-preview 从「预览」页签拉起的服务进程），
+       * 对账后逐个 attach，使它们以普通终端标签出现。
+       */
+      type: 'list'
+      /** 关联令牌；sessions 应答原样回显。 */
+      token?: string
+    }
+
+/**
+ * 会话列举里的一条摘要：只带对账需要的身份——宿主会话 id 与所属作用域，
+ * 不含输出（避免把重放缓冲带进控制帧）。标签名、cwd、退出状态一律由
+ * attach 应答（`attached`）给出，同一份事实不铺两条读取链。
+ */
+export interface SessionSummary {
+  /** 宿主会话 id。 */
+  terminalId: string
+  /** 会话所属作用域（工作区）；客户端据此决定落到哪个桶。 */
+  scope: string
+}
 
 /** 宿主 → 客户端消息。 */
 export type ServerMessage =
@@ -38,12 +60,24 @@ export type ServerMessage =
       cwd: string
       exited: boolean
       exitCode: number | null
+      /** 创建方指定的来源标签（如「预览 p4271」）；用户手工新建的会话缺省。 */
+      label?: string
       /** attach 请求携带的关联令牌；无则缺省。 */
       token?: string
     }
   | { type: 'output'; terminalId: string; data: string }
   | { type: 'exit'; terminalId: string; exitCode: number | null }
   | { type: 'closed'; terminalId: string }
+  | {
+      /**
+       * 会话列举应答：宿主当前的全部会话（含由别的插件创建的），每条只带
+       * 对账需要的身份，标签名与退出状态由后续 attach 应答给出。
+       */
+      type: 'sessions'
+      sessions: SessionSummary[]
+      /** list 请求携带的关联令牌；无则缺省。 */
+      token?: string
+    }
   | {
       type: 'error'
       message: string
@@ -177,6 +211,13 @@ export function parseClientMessage(raw: unknown): ClientMessage | undefined {
       if (typeof message.terminalId !== 'string') return undefined
       return { type: 'close', terminalId: message.terminalId }
     }
+    case 'list': {
+      if (!optionalString(message.token)) return undefined
+      return {
+        type: 'list',
+        ...(message.token === undefined ? {} : { token: message.token }),
+      }
+    }
     default:
       return undefined
   }
@@ -196,6 +237,7 @@ export function parseServerMessage(raw: unknown): ServerMessage | undefined {
       if (typeof message.terminalId !== 'string' || typeof message.cwd !== 'string'
         || typeof message.exited !== 'boolean'
         || !nullableNumber(message.exitCode)
+        || !optionalString(message.label)
         || !optionalString(message.token)) return undefined
       return {
         type: 'attached',
@@ -203,6 +245,7 @@ export function parseServerMessage(raw: unknown): ServerMessage | undefined {
         cwd: message.cwd,
         exited: message.exited,
         exitCode: message.exitCode,
+        ...(message.label === undefined ? {} : { label: message.label }),
         ...(message.token === undefined ? {} : { token: message.token }),
       }
     }
@@ -217,6 +260,21 @@ export function parseServerMessage(raw: unknown): ServerMessage | undefined {
     case 'closed': {
       if (typeof message.terminalId !== 'string') return undefined
       return { type: 'closed', terminalId: message.terminalId }
+    }
+    case 'sessions': {
+      if (!Array.isArray(message.sessions) || !optionalString(message.token)) return undefined
+      const sessions: SessionSummary[] = []
+      for (const entry of message.sessions as unknown[]) {
+        if (typeof entry !== 'object' || entry === null) return undefined
+        const row = entry as Record<string, unknown>
+        if (typeof row.terminalId !== 'string' || typeof row.scope !== 'string') return undefined
+        sessions.push({ terminalId: row.terminalId, scope: row.scope })
+      }
+      return {
+        type: 'sessions',
+        sessions,
+        ...(message.token === undefined ? {} : { token: message.token }),
+      }
     }
     case 'error': {
       if (typeof message.message !== 'string'

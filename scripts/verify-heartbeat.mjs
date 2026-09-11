@@ -32,6 +32,15 @@ const ctx = {
   connection: fakeConnection,
   logger: { info: () => {}, warn: (m) => console.log('WARN', m) },
   effect(fn) { this._dispose = fn() },
+  // 真 cordis 的 Service 基类经 ctx.reflect.provide 注册自身，调用时 this 是
+  // reflect 对象，所以必须回写闭包里的 ctx（写 this 会让 ctx.terminalSessions
+  // 读不到）。
+  reflect: {
+    provide(name, value) {
+      ctx[name] = value
+      return () => { delete ctx[name] }
+    },
+  },
 }
 
 // /bin/true 忽略 -i 并立即退出：会话创建后马上进入 exited 状态。

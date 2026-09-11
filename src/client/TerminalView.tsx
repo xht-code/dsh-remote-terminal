@@ -19,11 +19,18 @@ import type {} from './contract.ts'
 import type { WorkspaceSnapshot } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import { connectTerminal } from './connection.ts'
 import type { TerminalConnection } from './connection.ts'
+import { planReconcile } from './reconcile.ts'
 import { currentTheme, readCodeFontFamily } from './theme.ts'
 import { parseOsc7Cwd, tabLabel } from './labels.ts'
 import { DEFAULT_SCOPE, workspaceScope } from '../protocol.ts'
 import { workspaceForSession } from './workspace.ts'
 import { forgetSession, rememberSession, sessionsOf } from './sessions.ts'
+
+/**
+ * 连接就绪时向宿主索要会话快照的关联令牌。对账要等这条应答才能判定"本工作区到底
+ * 有没有终端"，所以首个终端的回退新建也挂在它上面（见 `sessions` 分支）。
+ */
+const RECONCILE_TOKEN = 'reconcile'
 
 /** 单个终端标签的展示状态。 */
 interface TabState {
@@ -32,6 +39,8 @@ interface TabState {
   /** 宿主会话 id；attach 应答到达前为空。 */
   terminalId: string | null
   cwd: string
+  /** 创建方指定的来源标签（如「预览 p4271」）：有则以它作标签名，没有再退回 cwd。 */
+  label: string | null
   exited: boolean
   exitCode: number | null
   error: string | null
@@ -220,9 +229,9 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
             // 因此按 key 补齐而不是只做 map。
             setTabs(prev => prev.some(tab => tab.key === token)
               ? prev.map(tab => tab.key === token
-                ? { ...tab, terminalId: message.terminalId, cwd: message.cwd, exited: message.exited, exitCode: message.exitCode }
+                ? { ...tab, terminalId: message.terminalId, cwd: message.cwd, label: message.label ?? null, exited: message.exited, exitCode: message.exitCode }
                 : tab)
-              : [...prev, { key: token, terminalId: message.terminalId, cwd: message.cwd, exited: message.exited, exitCode: message.exitCode, error: null }])
+              : [...prev, { key: token, terminalId: message.terminalId, cwd: message.cwd, label: message.label ?? null, exited: message.exited, exitCode: message.exitCode, error: null }])
             break
           }
           // 无 token：恢复的既有会话（重连/重挂载），补建缺失标签。
@@ -245,7 +254,7 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
           mountTerminal(connection, message.terminalId, message.terminalId)
           setTabs(prev => prev.some(tab => tab.key === message.terminalId)
             ? prev
-            : [...prev, { key: message.terminalId, terminalId: message.terminalId, cwd: message.cwd, exited: message.exited, exitCode: message.exitCode, error: null }])
+            : [...prev, { key: message.terminalId, terminalId: message.terminalId, cwd: message.cwd, label: message.label ?? null, exited: message.exited, exitCode: message.exitCode, error: null }])
           break
         }
         case 'output': {
@@ -290,7 +299,7 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
             // 建一个错误占位标签亮明原因。
             const key = 'err-' + nextErrorKeyRef.current++
             setTabs(prev => prev.length === 0
-              ? [{ key, terminalId: null, cwd: '', exited: false, exitCode: null, error: message.message }]
+              ? [{ key, terminalId: null, cwd: '', label: null, exited: false, exitCode: null, error: message.message }]
               : prev)
             setActiveKey(current => current ?? key)
             break
@@ -303,18 +312,39 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
           markTabError(activeKey, message.message)
           break
         }
+        case 'sessions': {
+          // 判定抽在 reconcile 模块里（纯函数，单独测试）：本工作区里宿主有、本地
+          // 既没挂接也没登记过的会话才补 attach——已经在标签栏里的跳过，免得把用户
+          // 刚关掉的标签又拉回来；别的工作区的跳过，否则切工作区时会看到不属于这里
+          // 的终端。
+          const plan = planReconcile({
+            rows: message.sessions,
+            scope,
+            known: sessionsOf(scope),
+            mountedKeys: [...mountedRef.current.keys()],
+          })
+          for (const terminalId of plan.adopt) {
+            rememberSession(scope, terminalId)
+            connection.send({ type: 'attach', terminalId })
+          }
+          // 首个终端的回退新建必须等这次对账：本工作区里可能只有别的插件拉起的会话，
+          // 抢在对账前建会话会让用户多出一个自己没要的 shell 标签。
+          if (message.token !== RECONCILE_TOKEN) break
+          if (!plan.needsFirstTerminal) break
+          addTab(scope)
+          break
+        }
       }
     })
 
     // 建会话的时机由视图决定：会话必须按终端实际尺寸创建，而尺寸要等 xterm 挂载
-    // 后才能测到，所以连接就绪只负责恢复当前工作区已知的会话，首个终端走 addTab。
+    // 后才能测到，所以连接就绪只负责恢复当前工作区已知的会话，再要一次会话快照。
     const unobserve = connection.onOpen(() => {
-      const known = sessionsOf(scope)
-      if (known.length === 0) {
-        if (mountedRef.current.size === 0) addTab(scope)
-        return
-      }
-      for (const sessionId of known) connection.send({ type: 'attach', terminalId: sessionId })
+      for (const sessionId of sessionsOf(scope)) connection.send({ type: 'attach', terminalId: sessionId })
+      // 快照用于发现不是本视图创建的会话（预览页签拉起的服务进程等）：对账后逐个
+      // attach，它们就会以普通终端标签出现。首个终端的回退新建也等这次应答，
+      // 见 `sessions` 分支。
+      connection.send({ type: 'list', token: RECONCILE_TOKEN })
     })
     connection.start()
     return () => {
@@ -356,7 +386,7 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
     const terminalId = mountedRef.current.get(key)?.terminalId ?? null
     setTabs(prev => prev.some(tab => tab.key === key)
       ? prev.map(tab => tab.key === key ? { ...tab, error } : tab)
-      : [...prev, { key, terminalId, cwd: '', exited: false, exitCode: null, error }])
+      : [...prev, { key, terminalId, cwd: '', label: null, exited: false, exitCode: null, error }])
   }
 
   /**
@@ -438,7 +468,7 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
     const connection = connectionRef.current
     if (connection === null) return
     const token = 'new-' + nextTokenRef.current++
-    setTabs(prev => [...prev, { key: token, terminalId: null, cwd: '', exited: false, exitCode: null, error: null }])
+    setTabs(prev => [...prev, { key: token, terminalId: null, cwd: '', label: null, exited: false, exitCode: null, error: null }])
     setActiveKey(token)
     mountTerminal(connection, token)
     window.requestAnimationFrame(() => {
@@ -518,7 +548,7 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
               title={tab.cwd.length > 0 ? tab.cwd : undefined}
               aria-current={tab.key === activeTab?.key}
             >
-              <span>{tab.terminalId === null ? t('view.terminal') : tabLabel(tab.cwd, t('view.terminal'))}</span>
+              <span>{tab.terminalId === null ? t('view.terminal') : (tab.label ?? tabLabel(tab.cwd, t('view.terminal')))}</span>
               {tab.exited && <span style={{ color: 'var(--dsw-alias-state-error-primary)' }}>●</span>}
             </button>
             <button

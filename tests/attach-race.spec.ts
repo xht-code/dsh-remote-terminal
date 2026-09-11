@@ -35,6 +35,7 @@ interface FakeCtx {
   connection: { requestRejection(request: { headers: IncomingMessage['headers'] }): 401 | 403 | undefined }
   logger: { info(): void; warn(): void }
   effect(fn: () => () => void): void
+  reflect: { provide(name: string, value: unknown): () => void }
   routes: UpgradeRoute[]
   dispose: (() => void) | undefined
 }
@@ -51,6 +52,8 @@ function fakeCtx(): FakeCtx {
     connection: { requestRejection: request => (request.headers['x-auth'] === 'ok' ? undefined : 401) },
     logger: { info: () => {}, warn: () => {} },
     effect(fn) { this.dispose = fn() },
+    // 真 cordis 的 Service 基类构造时经此注册自身；本用例不消费该服务，接住即可。
+    reflect: { provide: () => () => {} },
     routes,
     dispose: undefined,
   }

@@ -71,7 +71,7 @@ pnpm dev    # 可选：tsdown --watch；产物变化会被宿主热重载感知
 
 **宿主半体**（`lib/index.mjs`）：
 - 在 `webServer` 注册 WebSocket 升级路由（默认 `/api/remote-terminal/ws`），握手先过 `connection.requestRejection` 的信任围栏与浏览器认证，未认证一律拒绝；
-- 用 **node-pty** 为每个会话启动一个交互 shell（默认 `/bin/bash --rcfile <生成的包装 rc> -i`，先加载用户 rc 配置再注入 `PROMPT_COMMAND` 钩子，于每个提示符前输出 OSC 7 上报 cwd；Windows 为 PowerShell），环境经 `scrubbedParentEnv()` 清洗（不泄漏 `DEEPSEEK_*` / 凭据类变量）；
+- 用 **node-pty** 为每个会话启动一个交互 shell（默认 `/bin/bash --rcfile <生成的包装 rc> -i`，先加载用户 rc 配置再注入 `PROMPT_COMMAND` 钩子，于每个提示符前输出 OSC 7 上报 cwd；Windows 为 PowerShell），环境经 `scrubbedParentEnv()` 清洗（不泄漏凭据类变量；`DSH_*` 一并剔除，见「`DSH_*` 环境变量」）；
 - 会话按 id 登记（id 为随机串，不做递增序号，避免宿主重启后旧 id 命中新会话）：支持同一浏览器连接**同时挂接多个会话**（多终端标签）；输出经环形缓冲（默认 2 MiB）保留，向所有挂接的客户端广播；退出后会话保留可重连回看，close 销毁时通知全部挂接者；
 - 会话独立于浏览器连接保活：刷新页面 / 断线重连后重新 attach 已记录的会话集合并重放缓冲；不同标签页可同时挂接同一终端；
 - 会话集合按**工作区分桶**：新建、关闭、刷新恢复都只作用于当前工作区那组终端，切到别的工作区看到的是别的工作区自己的终端；宿主按同一个作用域键分别计算配额，一个工作区开满不影响别的工作区，另有总数上限兜底、防止跨工作区无限堆积；
@@ -114,6 +114,61 @@ pnpm dev    # 可选：tsdown --watch；产物变化会被宿主热重载感知
     scrollbackMaxBytes: 4194304
 ```
 
+## 给别的插件用：`ctx.terminalSessions`
+
+宿主半体把会话表作为 cordis 服务注册为 **`ctx.terminalSessions`**，让别的插件能把
+一个长驻进程放进终端，而不必自己再写一套进程管理：
+
+```ts
+import { workspaceScope } from 'dsh-remote-terminal'
+
+const sessionId = await ctx.terminalSessions.create({
+  command: '/bin/sh',
+  args: ['-c', 'pnpm dev'],
+  cwd: '/path/to/app',
+  // scope 决定会话落进哪个终端分桶，必须用 workspaceScope(workspaceId) 构造：
+  // 传错或省略，会话会落进 default 桶，所属工作区的终端视图对账时看不见它。
+  scope: workspaceScope(workspaceId),
+  env: { DSH_MY_PLUGIN_BASE: '/preview/p4271/' },  // 调用方负责注入自己的上下文
+  label: '预览 p4271',                             // 终端标签名（随 attached 下发）
+})
+ctx.terminalSessions.describe(sessionId)          // { exited, exitCode } | undefined
+ctx.terminalSessions.close(sessionId)             // true=确实关掉了一个运行中的会话
+```
+
+约定：
+
+- 拉起的会话与浏览器 attach 新建的终端**走同一条创建路径**，因此它会出现在会话
+  快照里，终端视图**在连接就绪时对账一次**并自动 attach——它就是一个普通终端标签，
+  以 `label` 作标签名，可看日志、可输入、可 Ctrl-C（视图已连着时新建的会话要等
+  重连/切工作区/刷新才出现）；
+- 对账只认「宿主有这个会话、本地没登记过」，**不区分来源、也不看是否已退出**：
+  别的浏览器标签页里手工新建的终端同样会被收养（同一个工作区共用一组终端，关会话
+  是宿主侧的事实，一处关掉处处收起）；已经退出的会话也照收养——服务崩掉时那段输出
+  正是要看的东西，标签会带上退出标记，此时视图不再回退新建 shell；
+- 类型：`ctx.terminalSessions` 的 `Context` 声明增强随本包提供，示例里的
+  `import { workspaceScope } from 'dsh-remote-terminal'` 已经把它带进来了；只用到
+  服务、不引用其它导出时，写一行 `import type {} from 'dsh-remote-terminal'`；
+- 这类会话标记为 `external`：**不占用手工终端的 `maxSessions` 配额**（否则拉几个服务
+  就会把用户的终端额度吃光），但仍受跨工作区的 `maxSessionsTotal` 兜底，且**配额吃紧
+  时同样会被当作闲置会话回收**——持有方只能靠 `describe()` 发现会话已消失；
+- 传了 `command` 就不套 bash rc 包装，也**不继承**配置里的 `shellArgs`：那批参数是
+  交互式 shell 的语义（POSIX 的 `-i`、Windows 的 `-NoLogo -NoProfile`），塞给
+  `pnpm dev` 会变成非法参数。要传参数请显式给 `args`；
+- 服务随本插件的 fiber 卸载而注销，调用方用 `ctx.inject(['terminalSessions'], …)`
+  拿即可把它当可选依赖。
+
+## `DSH_*` 环境变量
+
+终端会话的启动环境是 `scrubbedParentEnv()` 的结果：脱敏后的父进程环境，**剔除凭据类变量与全部 `DSH_*`**。这是 agent shell 的隔离约定，本插件刻意沿用——因此终端里**不会**有 `DSH_HOME`、`DSH_WEB_URL` 这类由 DSH 或插件发布的会话事实。
+
+需要某个 `DSH_*` 值时，两种做法：
+
+- **自己显式声明**：`DSH_MY_PLUGIN_BASE=/preview/p4271/ pnpm dev`，或写进 shell rc；
+- **经 `ctx.terminalSessions.create({ env })` 拉起**：把值写进那个进程的 env，不经过交互式 shell，也就不受这里的影响。
+
+> 为什么不做成「终端也继承注册表快照」：那会让终端页签与 bash / pwsh 工具的行为分叉（工具每次执行前 `ctx.shellEnv.collect()`，终端是长驻进程，只能在创建时取一次快照），并且给同一个变量引入两条来源。给业务进程传上下文的正解是**在拉起它的那一刻注入**，而不是改所有 shell 的环境。
+
 ## 常见问题
 
 **看不到「终端」tab**
@@ -150,7 +205,9 @@ pnpm build             # 产出 lib/index.mjs（宿主）+ lib/client.js（客�
 pnpm dev               # tsdown --watch，配合 link: 安装做本地调试
 pnpm typecheck         # 宿主 / 客户端 / 测试三层类型检查
 pnpm test              # 单元测试（vitest）：协议解析与粘贴分片、标签与 OSC 7 解析、
-                       #   配置归一化、会话分桶、配额回收（分区 + 总数兜底）、输出背压
+                       #   配置归一化、会话分桶、配额回收（分区 + 总数兜底）、输出背压、
+                       #   对外会话服务（拉起 / 配额隔离 / close 语义 / env 注入 /
+                       #   总数吃紧时的清理与回收 / 错误分支）、会话快照对账判定
 pnpm test:integration  # 集成验证：构建后以假上下文装配插件，驱动真实 PTY + WebSocket
 pnpm test:heartbeat    # 心跳回收验证（较慢，约 60–90s）：半开连接被终止且配额释放
 ```

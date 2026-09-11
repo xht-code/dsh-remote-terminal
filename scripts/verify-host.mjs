@@ -10,6 +10,14 @@ import { join } from 'node:path'
 import { WebSocket } from 'ws'
 import { apply } from '../lib/index.mjs'
 
+/**
+ * 取当前进程的共享运行层（与 src/index.ts 的 `Symbol.for` 键一致）。
+ * 只用于场景四直接断言引用计数与清理效果。
+ */
+function sharedStateOf() {
+  return globalThis[Symbol.for('dsh-remote-terminal.shared-state')]
+}
+
 const failures = []
 function check(label, ok, detail = '') {
   console.log((ok ? 'PASS' : 'FAIL') + ' ' + label + (detail ? ' — ' + detail : ''))
@@ -54,16 +62,41 @@ const fakeConnection = {
   },
 }
 
+/**
+ * 已注册的服务名。真 cordis 的服务表按 isolate 作用域共享，不随 ctx 走：同一插件的
+ * 两个 fiber 注册同名服务时，后一个必然抛错。假面照此办理，才能复现"并存窗口里
+ * 新 fiber 装配失败"这条路径（服务名若按 ctx 各存一份，第二个 fiber 会静默成功）。
+ */
+const providedServices = new Set()
+
 /** 最小 cordis ctx 假面：effect 记录 disposer，logger 静默。 */
 function fakeCtx() {
   const disposers = []
-  return {
+  const ctx = {
     webServer: fakeWebServer,
     connection: fakeConnection,
     logger: { info: () => {}, warn: () => {} },
     effect(fn) { disposers.push(fn()) },
+    // 真 cordis 的 Service 基类经 ctx.reflect.provide 注册自身，调用时 this 是
+    // reflect 对象，所以必须回写闭包里的 ctx（写 this 会让 ctx.terminalSessions
+    // 读不到）。同名服务已注册时必须抛错——与真 cordis 一致（reflect.ts 的
+    // `service "X" has been registered at <...>`），否则假面会掩盖重复装配问题。
+    // 这类注册不进 disposers：末尾的卸载检查按下标取插件的 teardown，
+    // Service 注册混进来会让下标错位。
+    reflect: {
+      provide(name, value) {
+        if (providedServices.has(name)) throw new Error('service "' + name + '" has been registered')
+        providedServices.add(name)
+        ctx[name] = value
+        return () => {
+          providedServices.delete(name)
+          delete ctx[name]
+        }
+      },
+    },
     _disposers: disposers,
   }
+  return ctx
 }
 
 const ctx = fakeCtx()
@@ -210,10 +243,30 @@ await new Promise((resolve, reject) => {
   setTimeout(() => reject(new Error('场景三超时')), 15000)
 })
 
-// 触发卸载清理：应移除路由并清杀会话。
-ctx._disposers[0]()
-check('卸载后路由已移除', fakeWebServer.registered.length === 0)
-check('卸载后 bash rc 私有目录已清理', ownRcDirs().length === 0, ownRcDirs().join(', '))
+// 场景四：并存窗口——主 ctx 仍持有共享层时，另一个 fiber 也来装配同一插件。
+// 真 cordis 下这会因服务重名当场抛错，失败层必须在抛错前把自己拿走的那份引用
+// 还回去，并把共享层的上下文交还给仍活着的主 ctx（否则路由握手与日志会一直用
+// 那个已失效的 fiber）。引用不归还的话，路由、心跳与全部 PTY 会活到进程结束。
+{
+  const probeCtx = fakeCtx()
+  const shared = sharedStateOf()
+  let raised = ''
+  try {
+    apply(probeCtx, { shellArgs: [] })
+  } catch (error) {
+    raised = String(error?.message ?? error)
+  }
+  check('并存窗口里新 fiber 因服务重名报错', raised.includes('terminalSessions'), raised)
+  check('装配失败后共享层上下文交还前一个持有者', shared.ctx === ctx,
+    shared.ctx === ctx ? '已交还主 ctx' : 'ctx 仍指向失败的 fiber')
+  check('装配失败后引用立即归还，未泄漏', shared.refs === 1, 'refs=' + shared.refs)
+
+  // 再按真实卸载路径释放主 ctx：引用归零才算彻底清理。
+  ctx._disposers[0]()
+  check('装配失败后引用仍能归零（无泄漏）', fakeWebServer.registered.length === 0,
+    '剩余路由 ' + fakeWebServer.registered.length + ' 条')
+  check('卸载后 bash rc 私有目录已清理', ownRcDirs().length === 0, ownRcDirs().join(', '))
+}
 
 httpServer.close()
 if (failures.length > 0) {

@@ -61,6 +61,13 @@ describe('parseServerMessage', () => {
       .toEqual({ ...base, token: 'new-7' })
   })
 
+  it('carries the creator label of a session when there is one', () => {
+    const base = { type: 'attached', terminalId: 'term-1', cwd: '/srv/app', exited: false, exitCode: null }
+    expect(parseServerMessage(JSON.stringify({ ...base, label: '预览 p4271' })))
+      .toEqual({ ...base, label: '预览 p4271' })
+    expect(parseServerMessage(JSON.stringify({ ...base, label: 7 }))).toBeUndefined()
+  })
+
   it('accepts both null and numeric exit codes', () => {
     const base = { type: 'attached', terminalId: 'term-1', cwd: '/srv/app', exited: true }
     expect(parseServerMessage(JSON.stringify({ ...base, exitCode: null })))
