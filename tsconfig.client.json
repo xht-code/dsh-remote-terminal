@@ -1,0 +1,16 @@
+{
+  // Client 侧声明产出：lib/types/client/index.d.ts（tsdown 的 client bundle 不管 d.ts）。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    // 补回 rootDir：否则声明会产出到 lib/types/index.d.ts，与 exports 声明不符。
+    "rootDir": "src",
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": true
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx"],
+  "exclude": ["lib"]
+}

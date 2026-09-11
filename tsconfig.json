@@ -1,0 +1,23 @@
+{
+  // Host 侧编译与 typecheck 配置；产物由 tsdown 生成，本文件只负责声明与检查。
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    // 不设 rootDir：include 同时覆盖 src/ 与根目录 tsdown.config.ts，固定根会触发 TS6059。
+    // 宿主产物（index.mjs / index.d.mts）由 tsdown 生成，本配置只做声明与检查，
+    // 因此 noEmit 恒开——它同时是 allowImportingTsExtensions 的合法前提。
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "declaration": true,
+    "declarationDir": "lib/types",
+    "outDir": "lib",
+    "sourceMap": true
+  },
+  "include": [
+    "src/index.ts",
+    "tsdown.config.ts"
+  ],
+  "exclude": [
+    "src/client",
+    "lib"
+  ]
+}

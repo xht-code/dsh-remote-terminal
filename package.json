@@ -1,0 +1,102 @@
+{
+  "name": "dsh-remote-terminal",
+  "version": "0.1.0",
+  "description": "DSH (DeepSeek Harness) 插件：在 Web GUI 会话视图栏（轨迹旁）增加完整交互式终端 tab，远程浏览器经 WebSocket 直连宿主 PTY shell",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "deepseek",
+    "dsh-plugin",
+    "terminal",
+    "xterm",
+    "pty",
+    "websocket",
+    "remote"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "xht-code",
+    "url": "https://github.com/xht-code"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xht-code/dsh-remote-terminal.git"
+  },
+  "homepage": "https://github.com/xht-code/dsh-remote-terminal",
+  "bugs": {
+    "url": "https://github.com/xht-code/dsh-remote-terminal/issues"
+  },
+  "dependencies": {
+    "node-pty": "1.2.0-beta.15",
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0-rc <5",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.2-alpha.5 <2",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cosmokit": "^1.8.2",
+    "@deepseek-ai/dsh-api-workspace-controller": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-client-store": "^0.1.2-alpha.5",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-subprocess": "0.1.2-alpha.5",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "@types/node": "^24.13.3",
+    "@types/react": "~18.3.1",
+    "@types/ws": "^8.18.1",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "react": "^18.2.0",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.8"
+  },
+  "scripts": {
+    "dev": "tsdown --watch",
+    "build": "tsdown && tsc -p tsconfig.client.json",
+    "prepublishOnly": "pnpm run build && pnpm run typecheck && pnpm test",
+    "test": "vitest run",
+    "test:integration": "pnpm run build && node scripts/verify-host.mjs",
+    "test:heartbeat": "pnpm run build && node scripts/verify-heartbeat.mjs",
+    "typecheck": "pnpm run typecheck:host && pnpm run typecheck:client && pnpm run typecheck:test",
+    "typecheck:host": "tsc -p tsconfig.json --noEmit",
+    "typecheck:client": "tsc -p tsconfig.client.json --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.mts",
+      "default": "./lib/index.mjs"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ],
+      "platform": "web"
+    }
+  }
+}

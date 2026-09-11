@@ -1,0 +1,11 @@
+{
+  // tests 类型检查；allowImportingTsExtensions 仅在与 noEmit 配合时合法。
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["tests/**/*.ts"],
+  "exclude": ["lib"]
+}

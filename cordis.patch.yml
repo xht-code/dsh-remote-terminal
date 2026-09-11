@@ -1,0 +1,11 @@
+# bundle patch 层：向 profile 插入本插件入口行。
+# 启用后无需配置；可选覆盖项见 src/index.ts 的 Config（shellPath/shellArgs/
+# maxSessions/scrollbackMaxBytes/wsPath），示例：
+#
+# - id: remote-terminal
+#   config:
+#     shellPath: /usr/bin/zsh
+
+- insert:
+    - id: remote-terminal
+      name: dsh-remote-terminal
