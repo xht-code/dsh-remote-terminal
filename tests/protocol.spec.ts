@@ -8,11 +8,16 @@ describe('parseClientMessage', () => {
 
   it('parses attach with every optional field', () => {
     const raw = JSON.stringify({
-      type: 'attach', terminalId: 'term-1', cwd: '/srv/app', cols: 120, rows: 40, scope: 'workspace:a', token: 'new-7',
+      type: 'attach', terminalId: 'term-1', cwd: '/srv/app', cols: 120, rows: 40, scope: 'workspace:a', token: 'new-7', since: 4096,
     })
     expect(parseClientMessage(raw)).toEqual({
-      type: 'attach', terminalId: 'term-1', cwd: '/srv/app', cols: 120, rows: 40, scope: 'workspace:a', token: 'new-7',
+      type: 'attach', terminalId: 'term-1', cwd: '/srv/app', cols: 120, rows: 40, scope: 'workspace:a', token: 'new-7', since: 4096,
     })
+  })
+
+  it('accepts since=0 as "replay from the very beginning"', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'attach', terminalId: 'term-1', since: 0 })))
+      .toEqual({ type: 'attach', terminalId: 'term-1', since: 0 })
   })
 
   it('parses input, resize and close', () => {
@@ -44,6 +49,8 @@ describe('parseClientMessage', () => {
     expect(parseClientMessage(JSON.stringify({ type: 'attach', terminalId: 7 }))).toBeUndefined()
     expect(parseClientMessage(JSON.stringify({ type: 'attach', token: 7 }))).toBeUndefined()
     expect(parseClientMessage(JSON.stringify({ type: 'attach', scope: 7 }))).toBeUndefined()
+    expect(parseClientMessage(JSON.stringify({ type: 'attach', terminalId: 'term-1', since: -1 }))).toBeUndefined()
+    expect(parseClientMessage(JSON.stringify({ type: 'attach', terminalId: 'term-1', since: '4096' }))).toBeUndefined()
     expect(parseClientMessage(JSON.stringify({ type: 'input', terminalId: 'term-1' }))).toBeUndefined()
     expect(parseClientMessage(JSON.stringify({ type: 'input', terminalId: 'term-1', data: 1 }))).toBeUndefined()
     expect(parseClientMessage(JSON.stringify({ type: 'resize', terminalId: 'term-1', cols: 100 }))).toBeUndefined()
@@ -77,8 +84,8 @@ describe('parseServerMessage', () => {
   })
 
   it('parses output, exit, closed and error', () => {
-    expect(parseServerMessage(JSON.stringify({ type: 'output', terminalId: 'term-1', data: 'hi' })))
-      .toEqual({ type: 'output', terminalId: 'term-1', data: 'hi' })
+    expect(parseServerMessage(JSON.stringify({ type: 'output', terminalId: 'term-1', data: 'hi', offset: 2 })))
+      .toEqual({ type: 'output', terminalId: 'term-1', data: 'hi', offset: 2 })
     expect(parseServerMessage(JSON.stringify({ type: 'exit', terminalId: 'term-1', exitCode: null })))
       .toEqual({ type: 'exit', terminalId: 'term-1', exitCode: null })
     expect(parseServerMessage(JSON.stringify({ type: 'closed', terminalId: 'term-1' })))
@@ -89,9 +96,16 @@ describe('parseServerMessage', () => {
       .toEqual({ type: 'error', message: 'gone', terminalId: 'term-9', token: 'new-7' })
   })
 
+  it('parses the synced marker that closes a replay', () => {
+    expect(parseServerMessage(JSON.stringify({ type: 'synced', terminalId: 'term-1', offset: 8192 })))
+      .toEqual({ type: 'synced', terminalId: 'term-1', offset: 8192 })
+    expect(parseServerMessage(JSON.stringify({ type: 'synced', terminalId: 'term-1' }))).toBeUndefined()
+    expect(parseServerMessage(JSON.stringify({ type: 'synced', offset: 8192 }))).toBeUndefined()
+  })
+
   it('drops unknown fields instead of passing them through', () => {
-    const raw = JSON.stringify({ type: 'output', terminalId: 'term-1', data: 'hi', extra: true })
-    expect(parseServerMessage(raw)).toEqual({ type: 'output', terminalId: 'term-1', data: 'hi' })
+    const raw = JSON.stringify({ type: 'output', terminalId: 'term-1', data: 'hi', offset: 2, extra: true })
+    expect(parseServerMessage(raw)).toEqual({ type: 'output', terminalId: 'term-1', data: 'hi', offset: 2 })
   })
 
   it('rejects malformed envelopes and wrong field types', () => {
@@ -102,6 +116,7 @@ describe('parseServerMessage', () => {
     expect(parseServerMessage(JSON.stringify({ type: 'attached', terminalId: 'term-1', cwd: '/srv', exited: 'no', exitCode: null }))).toBeUndefined()
     expect(parseServerMessage(JSON.stringify({ type: 'attached', terminalId: 'term-1', cwd: '/srv', exited: true, exitCode: '0' }))).toBeUndefined()
     expect(parseServerMessage(JSON.stringify({ type: 'output', terminalId: 'term-1' }))).toBeUndefined()
+    expect(parseServerMessage(JSON.stringify({ type: 'output', terminalId: 'term-1', data: 'hi', offset: '2' }))).toBeUndefined()
     expect(parseServerMessage(JSON.stringify({ type: 'exit', terminalId: 'term-1' }))).toBeUndefined()
     expect(parseServerMessage(JSON.stringify({ type: 'closed' }))).toBeUndefined()
     expect(parseServerMessage(JSON.stringify({ type: 'error' }))).toBeUndefined()

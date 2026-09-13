@@ -4,9 +4,10 @@
  * 指数退避重连。
  *
  * 连接只做传输与重连，不持有任何会话状态：会话集合的登记与恢复在 sessions
- * 模块（按工作区分桶），"何时新建终端、按什么尺寸新建"由视图决定——会话要按
- * 终端实际尺寸创建，而尺寸只有 xterm 挂载后才测得到，所以建会话的时机不能
- * 留在连接层（见 {@link TerminalConnection.onOpen}）。
+ * 模块（按工作区分桶），"何时新建终端、按什么尺寸新建、重挂时报什么 since"
+ * 由运行时（见 runtime 模块）决定——会话要按终端实际尺寸创建，而尺寸只有
+ * xterm 挂载后才测得到，所以建会话的时机不能留在连接层（见
+ * {@link TerminalConnection.onOpen}）。
  *
  * @module dsh-remote-terminal/client-connection
  */
@@ -27,9 +28,9 @@ const PENDING_LIMIT = 64
 export type MessageListener = (message: ServerMessage) => void
 
 /**
- * 浏览器侧终端连接句柄：只负责传输与重连。视图挂载时 {@link start}，卸载时
- * {@link close}；会话集合的登记、恢复与新建策略都在视图与 sessions 模块里，
- * 连接对象本身不持有任何会话状态。
+ * 浏览器侧终端连接句柄：只负责传输与重连。作用域运行时在视图挂上时
+ * {@link start}，离开超过宽限期时 {@link close}；会话集合的登记、恢复与新建
+ * 策略都在运行时与 sessions 模块里，连接对象本身不持有任何会话状态。
  */
 export interface TerminalConnection {
   /** 开始连接；幂等，重复调用不产生第二条连接。 */

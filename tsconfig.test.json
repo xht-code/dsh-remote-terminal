@@ -2,7 +2,9 @@
   // tests 类型检查；allowImportingTsExtensions 仅在与 noEmit 配合时合法。
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2023"],
+    // 客户端运行时的测试会 import src/client 下的模块（xterm 与 DOM 类型），
+    // 因此补上 DOM 库，与 tsconfig.client.json 对齐。
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "allowImportingTsExtensions": true,
     "noEmit": true
   },

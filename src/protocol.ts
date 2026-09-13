@@ -25,6 +25,12 @@ export type ClientMessage =
       scope?: string
       /** 客户端生成的关联令牌；新建终端的 attached/error 应答会原样回显。 */
       token?: string
+      /**
+       * 客户端已消费到的绝对输出偏移（见 {@link ServerMessage} 的 output.offset）。
+       * 给出时宿主只重放这之后的输出，客户端手里的画面因此可以接着长，不必清屏
+       * 重放；缺省表示从头重放（全新客户端）。
+       */
+      since?: number
     }
   | { type: 'input'; terminalId: string; data: string }
   | { type: 'resize'; terminalId: string; cols: number; rows: number }
@@ -65,9 +71,28 @@ export type ServerMessage =
       /** attach 请求携带的关联令牌；无则缺省。 */
       token?: string
     }
-  | { type: 'output'; terminalId: string; data: string }
+  | {
+      type: 'output'
+      terminalId: string
+      data: string
+      /**
+       * data 末字节在该会话输出流里的绝对偏移（会话创建起累计的 UTF-8 字节数）。
+       * 客户端按它记账，重挂时把 {@link ClientMessage} 的 attach.since 报回来，
+       * 宿主据此只补发缺口，既不重复也不需要清屏。
+       */
+      offset: number
+    }
   | { type: 'exit'; terminalId: string; exitCode: number | null }
   | { type: 'closed'; terminalId: string }
+  | {
+      /**
+       * 一次 attach 的重放已发完：客户端此刻的位置就是 offset。客户端据此把
+       * 重建中的终端一次性显示出来——重放过程不必让用户看见。
+       */
+      type: 'synced'
+      terminalId: string
+      offset: number
+    }
   | {
       /**
        * 会话列举应答：宿主当前的全部会话（含由别的插件创建的），每条只带
@@ -186,7 +211,9 @@ export function parseClientMessage(raw: unknown): ClientMessage | undefined {
         || !optionalNumber(message.cols)
         || !optionalNumber(message.rows)
         || !optionalString(message.scope)
-        || !optionalString(message.token)) return undefined
+        || !optionalString(message.token)
+        || !optionalNumber(message.since)
+        || (message.since !== undefined && message.since < 0)) return undefined
       return {
         type: 'attach',
         ...(message.terminalId === undefined ? {} : { terminalId: message.terminalId }),
@@ -195,6 +222,7 @@ export function parseClientMessage(raw: unknown): ClientMessage | undefined {
         ...(message.rows === undefined ? {} : { rows: message.rows }),
         ...(message.scope === undefined ? {} : { scope: message.scope }),
         ...(message.token === undefined ? {} : { token: message.token }),
+        ...(message.since === undefined ? {} : { since: message.since }),
       }
     }
     case 'input': {
@@ -250,8 +278,11 @@ export function parseServerMessage(raw: unknown): ServerMessage | undefined {
       }
     }
     case 'output': {
-      if (typeof message.terminalId !== 'string' || typeof message.data !== 'string') return undefined
-      return { type: 'output', terminalId: message.terminalId, data: message.data }
+      if (typeof message.terminalId !== 'string'
+        || typeof message.data !== 'string'
+        || !optionalNumber(message.offset)
+        || message.offset === undefined) return undefined
+      return { type: 'output', terminalId: message.terminalId, data: message.data, offset: message.offset }
     }
     case 'exit': {
       if (typeof message.terminalId !== 'string' || !nullableNumber(message.exitCode)) return undefined
@@ -260,6 +291,12 @@ export function parseServerMessage(raw: unknown): ServerMessage | undefined {
     case 'closed': {
       if (typeof message.terminalId !== 'string') return undefined
       return { type: 'closed', terminalId: message.terminalId }
+    }
+    case 'synced': {
+      if (typeof message.terminalId !== 'string'
+        || !optionalNumber(message.offset)
+        || message.offset === undefined) return undefined
+      return { type: 'synced', terminalId: message.terminalId, offset: message.offset }
     }
     case 'sessions': {
       if (!Array.isArray(message.sessions) || !optionalString(message.token)) return undefined

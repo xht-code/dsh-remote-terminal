@@ -142,6 +142,13 @@ interface ConnectionLike {
   }): 401 | 403 | undefined
 }
 
+/** 重放缓冲里的一块输出及其在会话流里的绝对结束偏移。 */
+interface ScrollbackChunk {
+  text: string
+  /** 该块末字节的绝对偏移（从会话创建起累计），用于按 since 精确续接。 */
+  end: number
+}
+
 /** 一个宿主持有的 PTY 终端会话。 */
 interface TerminalSession {
   id: string
@@ -152,8 +159,10 @@ interface TerminalSession {
   exited: boolean
   exitCode: number | null
   /** 重放缓冲：node-pty 的 UTF-8 已解码字符串块，按到达顺序重放。 */
-  scrollback: string[]
+  scrollback: ScrollbackChunk[]
   scrollbackBytes: number
+  /** 会话创建以来输出过的总字节数；也是下一条输出的绝对起始偏移。 */
+  produced: number
   clients: Set<WebSocket>
   /** 最近一次挂接集合清空的时刻（新建时视为空闲）：配额吃紧时据此回收孤儿会话。 */
   idleSince: number
@@ -551,7 +560,7 @@ async function handleAttach(
 ): Promise<void> {
   const existing = message.terminalId === undefined ? undefined : state.sessions.get(message.terminalId)
   if (existing !== undefined) {
-    attachClient(state, existing, ws, client, message.token)
+    attachClient(state, existing, ws, client, message.token, message.since)
     return
   }
   if (message.terminalId !== undefined) {
@@ -803,6 +812,7 @@ function createSession(state: SharedState, request: SpawnSessionRequest): Termin
     exitCode: null,
     scrollback: [],
     scrollbackBytes: 0,
+    produced: 0,
     clients: new Set(),
     idleSince: Date.now(),
     label: request.label,
@@ -810,7 +820,7 @@ function createSession(state: SharedState, request: SpawnSessionRequest): Termin
   }
   pty.onData((chunk) => {
     appendScrollback(state, session, chunk)
-    broadcast(state, session, { type: 'output', terminalId: session.id, data: chunk })
+    broadcast(state, session, { type: 'output', terminalId: session.id, data: chunk, offset: session.produced })
   })
   pty.onExit(({ exitCode, signal }) => {
     // 与宿主 LocalTerminalHandle 的语义一致：信号杀死时退出码记为 null。
@@ -824,26 +834,42 @@ function createSession(state: SharedState, request: SpawnSessionRequest): Termin
 
 /** 把一条输出追加进会话的重放缓冲，超出字节上限时从头部丢弃。 */
 function appendScrollback(state: SharedState, session: TerminalSession, chunk: string): void {
-  session.scrollback.push(chunk)
-  session.scrollbackBytes += Buffer.byteLength(chunk)
+  const bytes = Buffer.byteLength(chunk)
+  session.produced += bytes
+  session.scrollback.push({ text: chunk, end: session.produced })
+  session.scrollbackBytes += bytes
   while (session.scrollbackBytes > state.config.scrollbackMaxBytes && session.scrollback.length > 1) {
     const removed = session.scrollback.shift()
     if (removed === undefined) break
-    session.scrollbackBytes -= Buffer.byteLength(removed)
+    session.scrollbackBytes -= Buffer.byteLength(removed.text)
   }
 }
 
 /**
  * 把连接挂到会话上并完成重放握手：先发 attached 元信息，再重放缓冲
- * 输出，最后补发已退出状态。同一连接可挂接多个会话。
+ * 输出，最后补发已退出状态与 synced 标记。同一连接可挂接多个会话。
+ *
+ * `since` 给出客户端已消费到的绝对偏移时只重放此后的块：客户端手里的画面
+ * （以及终端的解析状态）因此可以原地续上，不必清屏重放整段历史。块按偏移
+ * 精确对齐，客户端报的位置只要取自 output.offset / synced.offset 就落在块
+ * 边界上，重放的起点因此不重不漏。缓冲已被头部裁剪（缺口早于保留窗口）时
+ * 只能从现有头部重放，客户端会看到接缝处少一段——这已是能给出的全部内容。
  *
  * @param state - 共享运行层。
  * @param session - 目标会话。
  * @param ws - 来源连接。
  * @param client - 来源连接的挂接状态。
  * @param token - attach 请求携带的关联令牌；缺省不回显。
+ * @param since - 客户端已消费到的绝对偏移；缺省表示从头重放。
  */
-function attachClient(state: SharedState, session: TerminalSession, ws: WebSocket, client: ClientState, token?: string): void {
+function attachClient(
+  state: SharedState,
+  session: TerminalSession,
+  ws: WebSocket,
+  client: ClientState,
+  token?: string,
+  since?: number,
+): void {
   // 已关闭的连接不得进入挂接集合：死连接会让会话的 clients 永不为空，
   // 该会话退出后也无法被 evictExitedSessions 回收。
   if (ws.readyState !== ws.OPEN) return
@@ -858,16 +884,18 @@ function attachClient(state: SharedState, session: TerminalSession, ws: WebSocke
     ...(session.label === undefined ? {} : { label: session.label }),
     ...(token === undefined ? {} : { token }),
   })
-  if (session.scrollback.length > 0) {
-    // 逐块重放而不是拼成一整帧：整帧会高达十数 MB（JSON 转义把控制字符膨胀到
-    // 6 倍），既让客户端一次吞下巨量文本，也让发送缓冲只在帧与帧之间才有检查点。
-    for (const chunk of session.scrollback) {
-      sendServerMessage(state, ws, { type: 'output', terminalId: session.id, data: chunk })
-    }
+  // 逐块重放而不是拼成一整帧：整帧会高达十数 MB（JSON 转义把控制字符膨胀到
+  // 6 倍），既让客户端一次吞下巨量文本，也让发送缓冲只在帧与帧之间才有检查点。
+  for (const chunk of session.scrollback) {
+    if (since !== undefined && chunk.end <= since) continue
+    sendServerMessage(state, ws, { type: 'output', terminalId: session.id, data: chunk.text, offset: chunk.end })
   }
   if (session.exited) {
     sendServerMessage(state, ws, { type: 'exit', terminalId: session.id, exitCode: session.exitCode })
   }
+  // 重放与随后的实时输出之间没有穿插（同一次事件循环里同步发完），因此这里报出
+  // 的位置就是客户端拿到 synced 时的确切位置。
+  sendServerMessage(state, ws, { type: 'synced', terminalId: session.id, offset: session.produced })
 }
 
 /**

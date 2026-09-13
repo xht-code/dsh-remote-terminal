@@ -12,7 +12,7 @@ import { apply } from '../lib/index.mjs'
 
 /**
  * 取当前进程的共享运行层（与 src/index.ts 的 `Symbol.for` 键一致）。
- * 只用于场景四直接断言引用计数与清理效果。
+ * 只用于场景五直接断言引用计数与清理效果。
  */
 function sharedStateOf() {
   return globalThis[Symbol.for('dsh-remote-terminal.shared-state')]
@@ -224,7 +224,71 @@ await new Promise((resolve, reject) => {
   setTimeout(() => reject(new Error('场景二超时')), 15000)
 })
 
-// 场景三：attach 已销毁的会话应回 error（刷新后恢复失效会话的路径）。
+// 场景三：输出偏移与增量续接——重挂时按 since 只补缺口，不重放界前内容。
+// 两条命令的回显不含结果里的标记，因此"看到标记"就等于结果已经输出完。
+await new Promise((resolve, reject) => {
+  const client = openClient()
+  let sessionId = ''
+  let phase = 'greet'
+  let accumulated = ''
+  let cumulative = 0
+  let offsetsAligned = true
+  let boundary = 0
+  client.on('error', reject)
+  client.on('message', (data) => {
+    const msg = JSON.parse(String(data))
+    if (msg.type === 'attached') {
+      sessionId = msg.terminalId
+      return
+    }
+    if (msg.type !== 'output') return
+    // 本次连接从会话创建起就挂着，因此收满全部输出时字节累计必须与偏移严格对齐。
+    cumulative += Buffer.byteLength(msg.data)
+    if (msg.offset !== cumulative) offsetsAligned = false
+    accumulated += msg.data
+    if (phase === 'greet' && accumulated.includes('\x1b]7;file:')) {
+      phase = 'first'
+      client.send(JSON.stringify({ type: 'input', terminalId: sessionId, data: "printf 'MARK%s\\n' -ONE\n" }))
+      return
+    }
+    if (phase === 'first' && accumulated.includes('MARK-ONE')) {
+      // 界前内容到此为止：续接的客户端不该再收到它。
+      phase = 'second'
+      boundary = cumulative
+      accumulated = ''
+      client.send(JSON.stringify({ type: 'input', terminalId: sessionId, data: "printf 'MARK%s\\n' -TWO\n" }))
+      return
+    }
+    if (phase !== 'second' || !accumulated.includes('MARK-TWO')) return
+    phase = 'resumed'
+    check('输出偏移与已收字节严格对齐', offsetsAligned, '累计 ' + cumulative + ' 字节')
+
+    const resumed = openClient()
+    let tail = ''
+    resumed.on('error', reject)
+    resumed.on('message', (d) => {
+      const m = JSON.parse(String(d))
+      if (m.type === 'output') tail += m.data
+      if (m.type !== 'synced') return
+      check('续接不重放界前内容', !tail.includes('MARK-ONE'), '补发 ' + tail.length + ' 字符')
+      check('续接补上界后产生的输出', tail.includes('MARK-TWO'))
+      check('synced 报出的位置 = 续接起点 + 补发字节', m.offset === boundary + Buffer.byteLength(tail),
+        'boundary=' + boundary + ' offset=' + m.offset)
+      resumed.close()
+      client.close()
+      resolve()
+    })
+    resumed.on('open', () => {
+      resumed.send(JSON.stringify({ type: 'attach', terminalId: sessionId, since: boundary }))
+    })
+  })
+  client.on('open', () => {
+    client.send(JSON.stringify({ type: 'attach', cwd: process.env.HOME, cols: 80, rows: 24, token: 'offset' }))
+  })
+  setTimeout(() => reject(new Error('场景三超时')), 15000)
+})
+
+// 场景四：attach 已销毁的会话应回 error（刷新后恢复失效会话的路径）。
 await new Promise((resolve, reject) => {
   const client = openClient()
   client.on('error', reject)
@@ -240,10 +304,10 @@ await new Promise((resolve, reject) => {
       resolve()
     }
   })
-  setTimeout(() => reject(new Error('场景三超时')), 15000)
+  setTimeout(() => reject(new Error('场景四超时')), 15000)
 })
 
-// 场景四：并存窗口——主 ctx 仍持有共享层时，另一个 fiber 也来装配同一插件。
+// 场景五：并存窗口——主 ctx 仍持有共享层时，另一个 fiber 也来装配同一插件。
 // 真 cordis 下这会因服务重名当场抛错，失败层必须在抛错前把自己拿走的那份引用
 // 还回去，并把共享层的上下文交还给仍活着的主 ctx（否则路由握手与日志会一直用
 // 那个已失效的 fiber）。引用不归还的话，路由、心跳与全部 PTY 会活到进程结束。
