@@ -114,13 +114,22 @@ export async function startHost(config: Config): Promise<HostHarness> {
     throw new Error('升级路由未注册：共享运行层可能仍被上一个未卸载的宿主持有')
   }
   const server = createServer()
-  server.on('upgrade', (req, socket, head) => { void route.handler(req, socket, head) })
+  server.on('upgrade', (req, socket, head) => {
+    // 与真宿主一致：升级路由按 path 匹配。若对任意路径都放行，"客户端连错路径"
+    // 的回归也会在用例里连上，把该能力的守卫测成绿的。
+    if ((req.url ?? '').split('?')[0] !== route.path) {
+      socket.destroy()
+      return
+    }
+    void route.handler(req, socket, head)
+  })
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('监听地址不可用')
+  // 地址按插件实际注册的路径拼。
   return {
     ctx,
-    url: `ws://127.0.0.1:${address.port}/api/remote-terminal/ws`,
+    url: `ws://127.0.0.1:${address.port}${route.path}`,
     stop() {
       // 与真 cordis 的卸载一致：先跑插件的 effect（teardown），再摘掉服务注册。
       ctx.dispose?.()

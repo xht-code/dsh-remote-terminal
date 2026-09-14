@@ -101,6 +101,10 @@ describe('parseServerMessage', () => {
       .toEqual({ type: 'synced', terminalId: 'term-1', offset: 8192 })
     expect(parseServerMessage(JSON.stringify({ type: 'synced', terminalId: 'term-1' }))).toBeUndefined()
     expect(parseServerMessage(JSON.stringify({ type: 'synced', offset: 8192 }))).toBeUndefined()
+    // 旧版本宿主可能多带字段：未知字段一律丢弃，两端因此可以只靠"新增可选字段"
+    // 演进——反过来把新字段做成必填，就会让旧宿主的帧整条被拒收。
+    expect(parseServerMessage(JSON.stringify({ type: 'synced', terminalId: 'term-1', offset: 8192, replayFrom: 4096 })))
+      .toEqual({ type: 'synced', terminalId: 'term-1', offset: 8192 })
   })
 
   it('drops unknown fields instead of passing them through', () => {

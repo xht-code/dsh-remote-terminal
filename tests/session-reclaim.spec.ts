@@ -1,6 +1,6 @@
 import { homedir } from 'node:os'
 import { describe, expect, it } from 'vitest'
-import { connect, sleep, startHost, waitFor } from './harness.ts'
+import { connect, sessionsServiceOf, sleep, startHost, waitFor } from './harness.ts'
 import type { TestClient } from './harness.ts'
 import type { ServerMessage } from '../src/protocol.ts'
 
@@ -209,6 +209,29 @@ describe('跨工作区总数上限（兜底）', () => {
 
       beta.ws.close()
       gamma.ws.close()
+    } finally {
+      host.stop()
+    }
+  })
+})
+
+describe('close 不要求本连接挂接过该会话', () => {
+  itPosix('知道 id 的连接就能关掉它，挂接者据此收起标签', async () => {
+    const host = await startHost({ ...idleShell, maxSessions: 2 })
+    try {
+      const owner = await connect(host.url)
+      const sessionId = (await attachNew(owner, 'owner')).terminalId
+
+      // 另一个窗口（或重连后的新连接）知道 id 即可关闭：断线窗口里入队的 close 会
+      // 在重连时先于 attach 冲刷到宿主，若要求"本连接挂接过"就会被丢弃——用户关掉
+      // 的终端会复活、宿主侧那个 shell 也永远没人关。
+      const other = await connect(host.url)
+      other.ws.send(JSON.stringify({ type: 'close', terminalId: sessionId }))
+      await waitFor(owner.received, message => message.type === 'closed' && message.terminalId === sessionId)
+      expect(sessionsServiceOf(host).describe(sessionId)).toBeUndefined()
+
+      owner.ws.close()
+      other.ws.close()
     } finally {
       host.stop()
     }

@@ -12,10 +12,7 @@
  * @module dsh-remote-terminal/client-connection
  */
 import type { ClientMessage, ServerMessage } from '../protocol.ts'
-import { parseServerMessage, splitInputChunks } from '../protocol.ts'
-
-/** 宿主升级路由（与宿主默认配置一致；自定义 wsPath 时此处需同步）。 */
-const WS_PATH = '/api/remote-terminal/ws'
+import { DEFAULT_WS_PATH, parseServerMessage, splitInputChunks } from '../protocol.ts'
 
 /** 重连退避：首次 1s，每次翻倍，封顶 15s。 */
 const RECONNECT_BASE_MS = 1000
@@ -123,7 +120,7 @@ class TerminalConnectionImpl implements TerminalConnection {
     // 互斥，这里再挡一层，避免关闭后仍建立新 socket。
     if (this.closed) return
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(protocol + '//' + window.location.host + WS_PATH)
+    const ws = new WebSocket(protocol + '//' + window.location.host + DEFAULT_WS_PATH)
     this.ws = ws
 
     ws.onopen = () => {

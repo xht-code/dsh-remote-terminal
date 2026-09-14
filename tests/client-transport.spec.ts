@@ -23,7 +23,7 @@ const fakes = vi.hoisted(() => {
     readonly options: Record<string, unknown>
     readonly written: string[] = []
     private callbacks: Array<() => void> = []
-    private dataHandler: ((data: string) => void) | undefined
+    dataHandler: ((data: string) => void) | undefined
 
     constructor(options: Record<string, unknown> = {}) {
       this.options = { ...options }
@@ -136,6 +136,18 @@ function createPanel(): HTMLElement {
   return new fakes.FakeElement() as unknown as HTMLElement
 }
 
+/** 页面可见性（fake document 用）：默认可见，切到浏览器其他标签页时才置为隐藏。 */
+let pageHidden = false
+
+/** visibilitychange 监听器：客户端模块级只注册一次，跨用例保留。 */
+const visibilityListeners: Array<() => void> = []
+
+/** 模拟页面被隐藏（切到浏览器其他标签页、最小化）。 */
+function hidePage(): void {
+  pageHidden = true
+  for (const listener of [...visibilityListeners]) listener()
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -180,9 +192,16 @@ beforeEach(() => {
     },
     clearTimeout: (id: number) => { timers.delete(id) },
   }
+  pageHidden = false
   Object.assign(globalThis, {
     window: fakeWindow,
-    document: { createElement: () => new fakes.FakeElement() },
+    document: {
+      createElement: () => new fakes.FakeElement(),
+      get visibilityState(): string { return pageHidden ? 'hidden' : 'visible' },
+      addEventListener: (type: string, listener: () => void): void => {
+        if (type === 'visibilitychange') visibilityListeners.push(listener)
+      },
+    },
     // 浏览器里文本帧的 event.data 就是字符串，node 的 ws 同样如此（已实测）。
     WebSocket: NodeWebSocket,
   })
@@ -230,6 +249,8 @@ describe('运行时与真实宿主', () => {
 
     // 视图切走：连接宽限 60 秒后释放（用测试定时器直接触发）。
     runtime.detachPanel()
+    // 只有页面被隐藏（用户真的离开）才会按宽限期释放连接。
+    hidePage()
     releaseDetachedConnection()
     await sleep(50)
 
@@ -261,6 +282,8 @@ describe('运行时与真实宿主', () => {
 
     // 收工：释放连接，避免测试结束后留下重连定时器。
     runtime.detachPanel()
+    // 只有页面被隐藏（用户真的离开）才会按宽限期释放连接。
+    hidePage()
     releaseDetachedConnection()
     await sleep(50)
   })
@@ -285,6 +308,8 @@ describe('运行时与真实宿主', () => {
     expect(queued, '命令未送达宿主').toBe(true)
 
     runtime.detachPanel()
+    // 只有页面被隐藏（用户真的离开）才会按宽限期释放连接。
+    hidePage()
     releaseDetachedConnection()
     // 等这条命令在宿主侧产生输出（此时客户端已挂断，输出只进了宿主的重放缓冲）。
     await sleep(2600)
@@ -297,6 +322,8 @@ describe('运行时与真实宿主', () => {
     expect(countOf(terminal.output(), 'UNIQ-C')).toBe(1)
 
     runtime.detachPanel()
+    // 只有页面被隐藏（用户真的离开）才会按宽限期释放连接。
+    hidePage()
     releaseDetachedConnection()
     await sleep(50)
   })

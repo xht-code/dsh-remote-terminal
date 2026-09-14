@@ -27,8 +27,12 @@ export type ClientMessage =
       token?: string
       /**
        * 客户端已消费到的绝对输出偏移（见 {@link ServerMessage} 的 output.offset）。
-       * 给出时宿主只重放这之后的输出，客户端手里的画面因此可以接着长，不必清屏
-       * 重放；缺省表示从头重放（全新客户端）。
+       * 宿主只重放这之后的输出，客户端手里的画面因此可以接着长，不必清屏重放；
+       * 缺省表示从头重放（全新客户端）。
+       *
+       * 报的必须是"客户端确实拥有的流位置"：本连接已收到的字节对应的位置，而不是
+       * 对话流末尾——宿主只按它过滤缓冲里还留着的块，不做别的校验，报大了就会静默
+       * 丢掉那段输出。缓冲被头部裁剪过时缺口补不回来，宿主会把还留着的内容整段重放。
        */
       since?: number
     }
@@ -144,6 +148,13 @@ export function workspaceScope(workspaceId: string): string {
  * 信封与转义留出余量；单帧上限存在的意义是给解析内存兜底，而不是卡住输入。
  */
 export const MAX_FRAME_BYTES = 1024 * 1024
+
+/**
+ * WebSocket 升级路由的默认路径，同时是宿主 `Config.wsPath` 的默认值。
+ * 两端共用本常量，避免同一个默认路径出现第二份硬编码；宿主把它配成别的值时
+ * 浏览器半体连不上——它读不到宿主配置，只会连本常量。
+ */
+export const DEFAULT_WS_PATH = '/api/remote-terminal/ws'
 
 /**
  * 把一条输入文本切成不超过 {@link MAX_INPUT_CHUNK_CHARS} 的分片。

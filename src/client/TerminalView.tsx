@@ -205,7 +205,7 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
               title={tab.cwd.length > 0 ? tab.cwd : undefined}
               aria-current={tab.key === activeTab?.key}
             >
-              <span>{tab.terminalId === null ? t('view.terminal') : (tab.label ?? tabLabel(tab.cwd, t('view.terminal')))}</span>
+              <span>{tab.label ?? tabLabel(tab.cwd, t('view.terminal'))}</span>
               {tab.exited && <span style={{ color: 'var(--dsw-alias-state-error-primary)' }}>●</span>}
             </button>
             <button

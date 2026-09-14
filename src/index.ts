@@ -33,7 +33,16 @@ import type { IPty } from 'node-pty'
 import { WebSocketServer } from 'ws'
 import type { WebSocket } from 'ws'
 import type { ClientMessage, ServerMessage, SessionSummary } from './protocol.ts'
-import { DEFAULT_SCOPE, MAX_COLS, MAX_FRAME_BYTES, MAX_ROWS, MIN_COLS, MIN_ROWS, parseClientMessage } from './protocol.ts'
+import {
+  DEFAULT_SCOPE,
+  DEFAULT_WS_PATH,
+  MAX_COLS,
+  MAX_FRAME_BYTES,
+  MAX_ROWS,
+  MIN_COLS,
+  MIN_ROWS,
+  parseClientMessage,
+} from './protocol.ts'
 
 /** 插件名（同时作为 Cordis 插件 id）。 */
 export const name = 'dsh-remote-terminal'
@@ -77,7 +86,7 @@ export const Config: z<Config> = z.object({
   maxSessions: z.number().min(1).default(8),
   maxSessionsTotal: z.number().min(1).default(32),
   scrollbackMaxBytes: z.number().min(1).default(2 * 1024 * 1024),
-  wsPath: z.string().default('/api/remote-terminal/ws'),
+  wsPath: z.string().default(DEFAULT_WS_PATH),
 })
 
 /** 补齐默认值后的运行时配置。 */
@@ -123,7 +132,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     maxSessions: config.maxSessions ?? 8,
     maxSessionsTotal: config.maxSessionsTotal ?? 32,
     scrollbackMaxBytes: config.scrollbackMaxBytes ?? 2 * 1024 * 1024,
-    wsPath: config.wsPath ?? '/api/remote-terminal/ws',
+    wsPath: config.wsPath ?? DEFAULT_WS_PATH,
   }
 }
 
@@ -851,9 +860,9 @@ function appendScrollback(state: SharedState, session: TerminalSession, chunk: s
  *
  * `since` 给出客户端已消费到的绝对偏移时只重放此后的块：客户端手里的画面
  * （以及终端的解析状态）因此可以原地续上，不必清屏重放整段历史。块按偏移
- * 精确对齐，客户端报的位置只要取自 output.offset / synced.offset 就落在块
- * 边界上，重放的起点因此不重不漏。缓冲已被头部裁剪（缺口早于保留窗口）时
- * 只能从现有头部重放，客户端会看到接缝处少一段——这已是能给出的全部内容。
+ * 精确对齐，客户端报的位置只要取自 output.offset 就落在块边界上，重放的起点
+ * 因此不重不漏。客户端报的位置早于缓冲还留着的第一块时（缓冲被裁剪过），
+ * 那些块一律重放：被裁掉的那段补不回来，但还留着的内容不会漏发。
  *
  * @param state - 共享运行层。
  * @param session - 目标会话。
