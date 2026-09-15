@@ -18,10 +18,10 @@
  * @module dsh-remote-terminal
  */
 import { randomBytes } from 'node:crypto'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir, userInfo } from 'node:os'
+import { isAbsolute, join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import type { IncomingMessage } from 'node:http'
 import { Service } from '@deepseek-ai/cordis'
@@ -62,9 +62,9 @@ export { DEFAULT_SCOPE, workspaceScope } from './protocol.ts'
 
 /** 插件配置。全部字段可选；运行时经 {@link resolveConfig} 补齐默认值。 */
 export interface Config {
-  /** 终端 shell 可执行文件路径；缺省按平台选 bash/powershell。 */
+  /** 终端 shell 可执行文件路径；缺省用账户里的登录 shell（Windows 为 PowerShell）。 */
   shellPath?: string
-  /** shell 启动参数；缺省按平台选交互式无配置参数。 */
+  /** shell 启动参数；缺省跟着实际要跑的 shell 算（见 {@link defaultShell}）。 */
   shellArgs?: string[]
   /** 同时存活的终端会话上限；按**每个工作区**分别计算，互不挤占。 */
   maxSessions?: number
@@ -89,28 +89,138 @@ export const Config: z<Config> = z.object({
   wsPath: z.string().default(DEFAULT_WS_PATH),
 })
 
+/** 默认交互 shell 的钩子包装方式：决定 cwd 上报钩子怎么注入。 */
+export type ShellWrap = 'bash' | 'zsh' | 'fish'
+
 /** 补齐默认值后的运行时配置。 */
 export interface ResolvedConfig {
   shellPath: string
   shellArgs: string[]
-  /** 是否对默认 bash 注入 --rcfile 包装（cwd 实时上报的前提）。 */
-  injectBashRc: boolean
+  /**
+   * 默认交互 shell 的钩子包装方式：`bash` 走 `--rcfile`、`zsh` 走 `ZDOTDIR`、
+   * `fish` 走 `--init-command`，三者都是"先让用户自己的配置生效，再注入 cwd
+   * 上报钩子"。自定义 shell，以及登录 shell 不认识的类型（sh、nu 等），为
+   * undefined——终端照常可用，只失去 cwd 实时上报（标签名与状态条停留于打开时
+   * 的目录）。
+   */
+  shellWrap: ShellWrap | undefined
+  /** 登录 shell 取不到、退回平台默认时的说明（供宿主打一条日志）；正常为 undefined。 */
+  shellWarning: string | undefined
   maxSessions: number
   maxSessionsTotal: number
   scrollbackMaxBytes: number
   wsPath: string
 }
 
+/** 登录 shell 的查询结果：拿不到时带上原因，由调用方决定退回什么、要不要告警。 */
+interface LoginShellLookup {
+  /** 账户数据库里的登录 shell；查不到或未记录时为 null。 */
+  shell: string | null
+  /** 只能退回平台默认时的原因；查到或平台用不上登录 shell 时为 undefined。 */
+  failure: string | undefined
+}
+
 /**
- * 按平台解析 shell 默认值：POSIX 用交互式 bash（加载用户 rc 配置，
- * 让人拿到自己的提示符与别名；不沿用 agent 终端刻意隔离的干净环境），
- * Windows 用 PowerShell。
+ * 账户数据库里记录的登录 shell（Linux / macOS 上即 `chsh` 改写的那一项）。
+ *
+ * Windows 没有这个概念（终端固定用 PowerShell），不去查账户；容器里 uid 不在
+ * `/etc/passwd` 时 Node 的 `userInfo()` 会直接抛错（实测 `uv_os_get_passwd`
+ * 返回 ENOENT），这里收成"查不到 + 原因"，而不是让插件加载整个失败。
+ *
+ * @returns 登录 shell 与查询失败原因。
  */
-function defaultShell(): { shellPath: string; shellArgs: string[] } {
-  if (process.platform === 'win32') {
-    return { shellPath: 'powershell.exe', shellArgs: ['-NoLogo', '-NoProfile'] }
+function currentLoginShell(): LoginShellLookup {
+  if (process.platform === 'win32') return { shell: null, failure: undefined }
+  try {
+    const shell = userInfo().shell
+    if (shell === null || shell.length === 0) return { shell: null, failure: '账户未记录登录 shell' }
+    return { shell, failure: undefined }
+  } catch (error) {
+    return { shell: null, failure: String(error) }
   }
-  return { shellPath: '/bin/bash', shellArgs: ['-i'] }
+}
+
+/**
+ * 按平台解析默认交互 shell：
+ * - Linux / macOS 用账户里的登录 shell：终端就该是你平时用的那个 shell，
+ *   提示符、别名与 PATH 才和你自己开的终端一致；
+ * - 账户查不到或未记录登录 shell 时退回平台默认（macOS `/bin/zsh`、其余
+ *   `/bin/bash`）；
+ * - Windows 默认用 PowerShell（不加载用户 profile，目录不实时跟随）。
+ *
+ * 默认启动参数跟着**实际要跑的 shell** 算：Windows 上只有真用 PowerShell 时才套
+ * `-NoLogo -NoProfile`，钉成 Git Bash 之类的 shell 就不套——`bash -NoLogo` 会以
+ * "无效的选项"直接退出（实测），要标志请自己写 `shellArgs`。
+ *
+ * macOS 下 zsh / fish 按**登录 shell** 启动（`-l -i`）：本机终端（Terminal.app /
+ * iTerm2）就是登录 shell，只有登录 shell 才会读 `~/.zprofile`（Homebrew 的
+ * `brew shellenv` 通常写在这里），fish 也只有登录 shell 才会按 macOS 的
+ * `/etc/paths`、`/etc/paths.d` 构造 PATH（见 fish 自带的 `config.fish` 里
+ * `status --is-login` 那一段）。Linux 的 GUI 终端（GNOME Terminal / Konsole）
+ * 是非登录交互 shell，保持一致。bash 不在其列：`--rcfile` 与 `-l` 互斥（实测
+ * `-l` 下 rcfile 不执行，把 `-l` 放在 `--rcfile` 前还会直接报无效选项），
+ * 因此 bash 仍以非登录方式启动，`~/.bash_profile` 不加载（见 README 限制一节）。
+ *
+ * @param platform - 目标平台。
+ * @param loginShell - 账户里的登录 shell（POSIX）或钉住的 shell 路径；没有时为 null。
+ * @returns 默认 shell 路径、启动参数，以及该 shell 的包装方式（{@link ShellWrap}；
+ *   认不出的 shell 为 undefined）。
+ */
+export function defaultShell(
+  platform: NodeJS.Platform,
+  loginShell: string | null,
+): { shellPath: string; shellArgs: string[]; shellWrap: ShellWrap | undefined } {
+  if (platform === 'win32') {
+    const shellPath = loginShell !== null && loginShell.length > 0 ? loginShell : 'powershell.exe'
+    return {
+      shellPath,
+      shellArgs: isPowerShell(shellPath) ? ['-NoLogo', '-NoProfile'] : [],
+      shellWrap: undefined,
+    }
+  }
+  const fallback = platform === 'darwin' ? '/bin/zsh' : '/bin/bash'
+  const shellPath = loginShell !== null && loginShell.length > 0 ? loginShell : fallback
+  const shellWrap = shellWrapOf(shellPath)
+  const loginShellArgs = platform === 'darwin' && (shellWrap === 'zsh' || shellWrap === 'fish')
+  return { shellPath, shellArgs: loginShellArgs ? ['-l', '-i'] : ['-i'], shellWrap }
+}
+
+/**
+ * 取路径末段作为可执行文件名；Windows 的分隔符是 `\`，两种都认。
+ *
+ * @param shellPath - shell 路径。
+ * @returns 可执行文件名（不含目录）。
+ */
+function executableName(shellPath: string): string {
+  return shellPath.slice(Math.max(shellPath.lastIndexOf('/'), shellPath.lastIndexOf('\\')) + 1)
+}
+
+/**
+ * 该路径是否就是 PowerShell（`powershell.exe` / `pwsh` 及其带 `.exe` 的形态）：
+ * 只有它才认 `-NoLogo -NoProfile`。
+ *
+ * @param shellPath - shell 路径。
+ * @returns 是 PowerShell 时为 true。
+ */
+function isPowerShell(shellPath: string): boolean {
+  const name = executableName(shellPath).toLowerCase()
+  return name === 'powershell' || name === 'powershell.exe' || name === 'pwsh' || name === 'pwsh.exe'
+}
+
+/**
+ * 按可执行文件名判定默认 shell 的包装方式：路径取末段比对，`/bin/zsh` 与
+ * `/opt/homebrew/bin/bash` 都能认出来。认不出的 shell（sh、nu、nologin 等）
+ * 没有通用的注入入口，返回 undefined。
+ *
+ * @param shellPath - 已解析出的 shell 路径。
+ * @returns 包装方式；无法注入时为 undefined。
+ */
+function shellWrapOf(shellPath: string): ShellWrap | undefined {
+  const executable = executableName(shellPath)
+  if (executable === 'bash') return 'bash'
+  if (executable === 'zsh') return 'zsh'
+  if (executable === 'fish') return 'fish'
+  return undefined
 }
 
 /**
@@ -120,15 +230,34 @@ function defaultShell(): { shellPath: string; shellArgs: string[] } {
  * @returns 补齐默认值后的运行时配置。
  */
 export function resolveConfig(config: Config): ResolvedConfig {
-  const shell = defaultShell()
-  // schemastory 会把未配置的数组字段物化为空数组：空数组与未提供等价。
-  const useDefaultShell = config.shellPath === undefined
-    && (config.shellArgs === undefined || config.shellArgs.length === 0)
+  const login = currentLoginShell()
+  // schemastery 会把未配置的数组字段物化为空数组，YAML 里写了键却不给值则是 null：
+  // 缺省 / 空 / null 三种形态一律按"未提供"处理。否则会出现"用了默认 shell 却按
+  // 已配置处理、于是不注入钩子"这种半吊子状态，甚至读 `.length` 直接抛错。
+  const pinnedPath = typeof config.shellPath === 'string' && config.shellPath.length > 0
+    ? config.shellPath
+    : undefined
+  const configuredArgs = Array.isArray(config.shellArgs) && config.shellArgs.length > 0
+    ? config.shellArgs
+    : undefined
+  // 平台默认值跟着**实际要跑的 shell** 算：钉了 shellPath 就是它，否则是账户里的
+  // 登录 shell。否则 macOS 上会错配——账户是 bash 而钉了 zsh / fish 时少了 `-l`
+  // （丢掉 `~/.zprofile` 与 fish 的 macOS PATH 构造），账户是 zsh 而钉了 bash 时
+  // 又多出 `-l`（bash 侧靠 `--rcfile` 挂钩子，与 `-l` 互斥）。
+  const shell = defaultShell(process.platform, pinnedPath ?? login.shell)
+  const usesDefaults = pinnedPath === undefined && configuredArgs === undefined
   return {
-    shellPath: config.shellPath !== undefined && config.shellPath.length > 0 ? config.shellPath : shell.shellPath,
-    shellArgs: config.shellArgs !== undefined && config.shellArgs.length > 0 ? config.shellArgs : shell.shellArgs,
-    // --rcfile 包装只对默认 bash 语义成立；自定义 shell 时无从注入。
-    injectBashRc: useDefaultShell && process.platform !== 'win32',
+    // 钉过的路径显式优先；平台默认值只在前者缺省时兜底。
+    shellPath: pinnedPath ?? shell.shellPath,
+    shellArgs: configuredArgs ?? shell.shellArgs,
+    // 包装按默认 shell 的类型注入；显式指定 shellPath / shellArgs 时无从假设语义
+    // （`--norc` 之类的自定义参数本就意在绕开配置），一律不注入。
+    shellWrap: usesDefaults ? shell.shellWrap : undefined,
+    // 只在确实用了平台默认路径时才告警：用户自己钉了 shellPath 时，登录 shell 查
+    // 不到与他无关。
+    shellWarning: pinnedPath === undefined && login.failure !== undefined
+      ? '无法确定账户的登录 shell（' + login.failure + '），已退回 ' + shell.shellPath
+      : undefined,
     maxSessions: config.maxSessions ?? 8,
     maxSessionsTotal: config.maxSessionsTotal ?? 32,
     scrollbackMaxBytes: config.scrollbackMaxBytes ?? 2 * 1024 * 1024,
@@ -199,8 +328,8 @@ interface SharedState {
   wss: WebSocketServer
   sessions: Map<string, TerminalSession>
   routeDisposer: (() => void) | undefined
-  /** 已生成的 bash rc 私有目录（0700，内含 rc.sh）；未生成时为 undefined。 */
-  bashRcDir: string | undefined
+  /** 已生成的 shell 包装：私有目录 + 该类型要注入的入口（bash 的 rc 文件 / zsh 的 ZDOTDIR）。 */
+  shellWrap: { kind: ShellWrap; dir: string; entry: string } | undefined
   /** 半开连接回收的心跳定时器。 */
   heartbeat: NodeJS.Timeout | undefined
 }
@@ -233,6 +362,152 @@ const BASH_RC_WRAPPER = [
   'PROMPT_COMMAND="__dsh_rt_report_cwd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"',
 ].join('\n') + '\n'
 
+/**
+ * zsh 包装脚本读用户配置所用的私有环境变量：ZDOTDIR 被本插件改写前的真实值。
+ * 用户自己的 `.zshenv` / `.zshrc` 在 ZDOTDIR 指向包装目录后已不可见，
+ * 包装脚本靠它回源。
+ */
+const ZSH_USER_ZDOTDIR_ENV = '__DSH_RT_USER_ZDOTDIR'
+
+/**
+ * zsh 没有 `--rcfile`，唯一能在用户配置之外插一脚的入口是 **ZDOTDIR**：zsh 每读
+ * 一个启动文件都按**当前** `$ZDOTDIR` 定位，所以把 ZDOTDIR 指到私有包装目录后，
+ * 用户那几份文件就不再被 zsh 自动加载，改由包装脚本按同样的时机回源：
+ *
+ * - `.zshenv` 对所有 zsh（含非交互）都执行，用户常在这里设 PATH；
+ * - `.zprofile` 只对**登录** shell 执行（macOS 下按 `-l` 启动，见
+ *   {@link defaultShell}），是 Homebrew `brew shellenv` 一类的所在地；
+ * - `.zshrc` 只对交互 shell 执行，是提示符、别名、补全与各框架（oh-my-zsh /
+ *   prezto / zim）的所在地。
+ *
+ * 两份"回源型"包装（`.zshenv` / `.zprofile`）都做三件事：把 ZDOTDIR 临时交给用户
+ * （配置里读 `$ZDOTDIR` 的地方才拿得到自己的目录）、回源、再把 ZDOTDIR **交还**
+ * 包装目录（否则 zsh 会顺着用户的新 ZDOTDIR 去找下一个启动文件，我们的
+ * `.zshrc` 就轮不到了）。回源后若用户改了 ZDOTDIR（"把配置放 `~/.config/zsh`"
+ * 的标准做法），一律采纳新值，`ZDOTDIR` 与私有变量都跟着更新，后续回源用新目录。
+ *
+ * `.zshrc` 包装则先把 ZDOTDIR 还原成用户原值再回源，否则
+ * `source "${ZDOTDIR:-$HOME}/…"` 这类框架初始化会去包装目录里找文件。
+ * `.zlogin` 不需要包装：它在 `.zshrc` 之后才执行，那时 ZDOTDIR 已是用户原值，
+ * zsh 自己就会去用户目录取。回源之后才挂 cwd 上报钩子，于是钩子不会被用户自己的
+ * `precmd` 定义顶掉；`add-zsh-hook` 追加到 precmd 队列尾，用户已有的钩子仍按原
+ * 顺序先跑。
+ *
+ * @param fileName - 要回源的启动文件名。
+ * @returns 该文件的包装内容。
+ */
+function zshSourceWrapper(fileName: '.zshenv' | '.zprofile'): string {
+  return [
+    `if [ -n "$${ZSH_USER_ZDOTDIR_ENV}" ]; then`,
+    '  __dsh_rt_wrap_zdotdir="$ZDOTDIR"',
+    `  ZDOTDIR="$${ZSH_USER_ZDOTDIR_ENV}"`,
+    `  if [ -f "$ZDOTDIR/${fileName}" ]; then`,
+    `    . "$ZDOTDIR/${fileName}"`,
+    '  fi',
+    `  if [ -n "$ZDOTDIR" ]; then`,
+    `    ${ZSH_USER_ZDOTDIR_ENV}="$ZDOTDIR"`,
+    '  fi',
+    '  ZDOTDIR="$__dsh_rt_wrap_zdotdir"',
+    '  unset __dsh_rt_wrap_zdotdir',
+    'fi',
+  ].join('\n') + '\n'
+}
+
+const ZSH_ZSHENV_WRAPPER = zshSourceWrapper('.zshenv')
+
+const ZSH_ZPROFILE_WRAPPER = zshSourceWrapper('.zprofile')
+
+const ZSH_ZSHRC_WRAPPER = [
+  `ZDOTDIR="$${ZSH_USER_ZDOTDIR_ENV}"`,
+  `unset ${ZSH_USER_ZDOTDIR_ENV}`,
+  '',
+  'if [ -f "$ZDOTDIR/.zshrc" ]; then',
+  '  . "$ZDOTDIR/.zshrc"',
+  'fi',
+  '',
+  `__dsh_rt_report_cwd() { printf '\\033]7;file://%s%s\\033\\\\' "\${HOSTNAME:-localhost}" "$PWD"; }`,
+  'autoload -Uz add-zsh-hook',
+  'add-zsh-hook precmd __dsh_rt_report_cwd',
+].join('\n') + '\n'
+
+/**
+ * fish 的启动注入命令：作为 `--init-command`（`-C`）的实参传入，不落盘。
+ *
+ * fish 的 `-C` 在读完用户的 `config.fish` **之后**执行（实测），所以这里不需要
+ * 回源任何配置——用户自己的提示符、别名与插件已经生效，只补一个提示符钩子。
+ * 也不用 `XDG_CONFIG_HOME` 那类"换个目录再回源"的做法：那个变量不只影响 fish，
+ * 会把整个会话里所有 XDG 应用都指到私有目录去。
+ *
+ * `--on-event fish_prompt` 是 fish 每次绘制提示符前触发的事件，等价于 bash 的
+ * `PROMPT_COMMAND` / zsh 的 `precmd`；事件函数与用户自己的提示符函数互不干扰。
+ * 主机名用 fish 的保留变量 `$hostname`（官方就是为去掉对 `hostname` 可执行文件
+ * 的依赖而提供），既不 fork 也不受 PATH 影响；它为空时输出仍是合法的
+ * `file:///path`，客户端照常解析出路径。
+ *
+ * 导出以便单测把生成结果喂给真实 fish 验证。
+ */
+export const FISH_INIT_COMMAND = [
+  'function __dsh_rt_report_cwd --on-event fish_prompt',
+  `    printf '\\033]7;file://%s%s\\033\\\\' "$hostname" "$PWD"`,
+  'end',
+].join('\n') + '\n'
+
+/**
+ * 按 shell 类型生成包装文件（文件名 → 内容）。
+ *
+ * bash 只有一份 rc 文件，经 `--rcfile` 注入；zsh 是一整个 ZDOTDIR 目录，靠改写
+ * 环境变量生效（登录 shell 下 `.zprofile` 会被读到，非登录时它只是躺在目录里）；
+ * fish 不落盘（见 {@link FISH_INIT_COMMAND}）。导出以便单测与集成脚本把生成结果
+ * 喂给真实 shell 验证。
+ *
+ * @param kind - 包装类型；fish 不需要文件，故不接受。
+ * @returns 要写进私有包装目录的文件。
+ */
+export function shellWrapFiles(kind: 'bash' | 'zsh'): Record<string, string> {
+  if (kind === 'bash') return { 'bash-rc.sh': BASH_RC_WRAPPER }
+  return {
+    '.zshenv': ZSH_ZSHENV_WRAPPER,
+    '.zprofile': ZSH_ZPROFILE_WRAPPER,
+    '.zshrc': ZSH_ZSHRC_WRAPPER,
+  }
+}
+
+/**
+ * 把 shell 包装接到启动参数与环境变量上（纯函数，便于单测直接喂给真实 shell）。
+ *
+ * bash 走 `--rcfile`；zsh 走 ZDOTDIR（同时把用户真实配置目录交给包装脚本回源）；
+ * fish 走 `-C`。`entry` 缺失表示包装没生成出来，此时不注入任何东西。
+ *
+ * @param kind - 包装类型。
+ * @param entry - 包装入口：bash 的 rc 文件路径、zsh 的 ZDOTDIR 目录；fish 不需要（传 undefined）。
+ * @param parentEnv - 终端将要使用的环境（zsh 用它取用户真实配置目录）。
+ * @returns 要前置到启动参数里的项，以及要叠加到环境上的变量。
+ */
+export function shellWrapInjection(
+  kind: ShellWrap,
+  entry: string | undefined,
+  parentEnv: Record<string, string>,
+): { args: string[]; env: Record<string, string> } {
+  if (kind === 'fish') return { args: ['-C', FISH_INIT_COMMAND], env: {} }
+  if (entry === undefined) return { args: [], env: {} }
+  if (kind === 'bash') return { args: ['--rcfile', entry], env: {} }
+  return { args: [], env: { [ZSH_USER_ZDOTDIR_ENV]: userZdotdirOf(parentEnv), ZDOTDIR: entry } }
+}
+
+/**
+ * 取用户真实的 zsh 配置目录，语义与 zsh 自己的 `${ZDOTDIR:-$HOME}` 一致。
+ *
+ * @param env - 终端进程将要使用的环境。
+ * @returns 用户配置目录。
+ */
+function userZdotdirOf(env: Record<string, string>): string {
+  const zdotdir = env.ZDOTDIR
+  if (zdotdir !== undefined && zdotdir.length > 0) return zdotdir
+  const home = env.HOME
+  if (home !== undefined && home.length > 0) return home
+  return homedir()
+}
+
 /** 把数值夹取到闭区间内。 */
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(Math.trunc(value), min), max)
@@ -246,6 +521,22 @@ function warn(state: SharedState, message: string): void {
 /** 经当前 fiber 的 logger 发出调试信息。 */
 function info(state: SharedState, message: string): void {
   state.ctx.logger?.info?.('[' + name + '] ' + message)
+}
+
+/**
+ * 尽力删除一个 shell 包装私有目录：删不掉只记一条日志，不打断调用方
+ * （卸载与"写失败后回收半成品"都不该因为一个删不掉的临时目录而失败）。
+ *
+ * @param state - 共享运行层。
+ * @param dir - 要删除的目录。
+ * @param failurePrefix - 失败日志的前缀。
+ */
+function removeWrapDir(state: SharedState, dir: string, failurePrefix: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (error) {
+    warn(state, failurePrefix + String(error))
+  }
 }
 
 /**
@@ -266,7 +557,7 @@ function acquireSharedState(ctx: Context, config: ResolvedConfig): SharedState {
       wss: new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES }),
       sessions: new Map(),
       routeDisposer: undefined,
-      bashRcDir: undefined,
+      shellWrap: undefined,
       heartbeat: undefined,
     }
     slot[sharedStateKey] = state
@@ -305,13 +596,9 @@ export function releaseSharedState(state: SharedState): void {
   }
   state.sessions.clear()
   state.wss.close()
-  if (state.bashRcDir !== undefined) {
-    try {
-      rmSync(state.bashRcDir, { recursive: true, force: true })
-    } catch (error) {
-      warn(state, '清理 bash rc 临时目录失败：' + String(error))
-    }
-    state.bashRcDir = undefined
+  if (state.shellWrap !== undefined) {
+    removeWrapDir(state, state.shellWrap.dir, '清理 shell 包装临时目录失败：')
+    state.shellWrap = undefined
   }
   const slot = sharedStateSlot()
   if (slot[sharedStateKey] === state) delete slot[sharedStateKey]
@@ -733,25 +1020,46 @@ function createSessionId(state: SharedState): string {
 }
 
 /**
- * 生成 bash rc 包装文件（惰性、幂等），返回其路径；生成失败时返回
- * undefined，此时会话退回普通交互式 bash（仅失去 cwd 实时上报）。
- * 文件写在进程私有的 0700 临时目录内，不落在可预测的共享路径上。
+ * 生成 shell 包装（惰性、幂等），返回该类型要注入的入口：bash 是 rc 文件路径，
+ * zsh 是 ZDOTDIR 目录；生成失败时返回 undefined，此时会话退回不带包装的交互式
+ * shell（仅失去 cwd 实时上报）。文件写在进程私有的 0700 临时目录内，不落在可
+ * 预测的共享路径上。
  *
  * @param state - 共享运行层。
- * @returns rc 文件路径；不可用时为 undefined。
+ * @param kind - 包装类型；fish 不落盘，故不接受。
+ * @returns 注入入口；不可用时为 undefined。
  */
-function ensureBashRc(state: SharedState): string | undefined {
-  if (state.bashRcDir !== undefined) return join(state.bashRcDir, 'rc.sh')
+function ensureShellWrap(state: SharedState, kind: 'bash' | 'zsh'): string | undefined {
+  const existing = state.shellWrap
+  // 缓存命中还要求包装文件仍在：宿主长跑期间 /tmp 可能被外部清理（systemd-tmpfiles
+  // 默认会清、tmpfs 重启即空、也可能被手动清），继续用不存在的入口会让 shell 静默地
+  // 连用户自己的配置一起不加载。
+  if (existing !== undefined && existing.kind === kind
+    && Object.keys(shellWrapFiles(kind)).every(name => existsSync(join(existing.dir, name)))) {
+    return existing.entry
+  }
+  // 目录按 shell 类型复用（热重载换了默认 shell 时不必重建，两类文件互不干扰）；
+  // 目录也一并校验，只清理本次新建的那一个，复用中的目录还有别的会话在用。
+  let dir = existing !== undefined && existsSync(existing.dir) ? existing.dir : undefined
+  let createdDir = false
   try {
-    // mkdtemp 建 0700 私有目录：若直接把可预测文件名写进共享 /tmp，他人可
-    // 预置同名符号链接，令 writeFileSync 跟随软链截断任意目标文件。
-    const dir = mkdtempSync(join(tmpdir(), 'dsh-remote-terminal-'))
-    const file = join(dir, 'rc.sh')
-    writeFileSync(file, BASH_RC_WRAPPER, { mode: 0o600 })
-    state.bashRcDir = dir
-    return file
+    if (dir === undefined) {
+      // mkdtemp 建 0700 私有目录：若直接把可预测文件名写进共享 /tmp，他人可
+      // 预置同名符号链接，令 writeFileSync 跟随软链截断任意目标文件。
+      dir = mkdtempSync(join(tmpdir(), 'dsh-remote-terminal-'))
+      createdDir = true
+    }
+    for (const [name, content] of Object.entries(shellWrapFiles(kind))) {
+      writeFileSync(join(dir, name), content, { mode: 0o600 })
+    }
+    // zsh 的入口是目录本身（ZDOTDIR），bash 的入口是目录里那份 rc 文件。
+    const entry = kind === 'zsh' ? dir : join(dir, 'bash-rc.sh')
+    state.shellWrap = { kind, dir, entry }
+    return entry
   } catch (error) {
-    warn(state, '写入 bash rc 包装失败，cwd 实时上报不可用：' + String(error))
+    // 写失败就不留半成品：目录是本函数刚建的，这里直接回收，免得每次重试再攒一个。
+    if (createdDir && dir !== undefined) removeWrapDir(state, dir, '回收半成品 shell 包装目录失败：')
+    warn(state, '写入 ' + kind + ' 包装失败，cwd 实时上报不可用：' + String(error))
     return undefined
   }
 }
@@ -782,7 +1090,7 @@ interface SpawnSessionRequest {
  * 创建并挂载一个 PTY 会话：spawn 后立即接线输出与退出事件，返回
  * 尚未写入会话表的会话对象（发布由调用方完成）。
  *
- * 传了 `command` 时不套 bash rc 包装：包装只为交互式 shell 的提示符钩子存在，
+ * 传了 `command` 时不套 shell 包装：包装只为交互式 shell 的提示符钩子存在，
  * 拉起的业务进程（dev server 等）不需要、也不该继承那套 `-i` 语义。
  *
  * @param state - 共享运行层。
@@ -792,13 +1100,48 @@ interface SpawnSessionRequest {
 function createSession(state: SharedState, request: SpawnSessionRequest): TerminalSession {
   const runsCommand = request.command !== undefined
   const file = request.command ?? state.config.shellPath
+  // node-pty 对不存在或不可执行的 shell **不抛错**，只是让进程立刻以 1 退出
+  // （实测），在终端上表现为"一闪就退"、看不出原因。登录 shell 由账户决定，可能
+  // 指向已卸载的程序，所以这里先校验一次，把失败变成一条能指出出路的错误。
+  //
+  // 只校验 POSIX 的**绝对**路径：
+  // - 账户里的登录 shell 必然是绝对路径，这就是本校验的主要目标；
+  // - 相对路径的真实含义要按"子进程 chdir 之后的物理目录"解析（node-pty 是先
+  //   chdir 再 execvp），而 path.resolve 是纯词法的：cwd 含软链、或路径里带 `..`
+  //   时两者会指向不同文件，判断错了比不判断更糟（误杀能跑的配置 / 放行跑不起来的）；
+  // - 裸名（Windows 的 powershell.exe、POSIX 的 `zsh`）要按 PATH 查找，同理不预判；
+  // - Windows 的 X_OK 语义与 POSIX 不同，也不在这里判断。
+  if (!runsCommand && process.platform !== 'win32' && isAbsolute(file)) {
+    let reason: string | undefined
+    try {
+      // 目录也能通过 X_OK（对目录来说它是"可搜索"位），所以先确认是普通文件；
+      // statSync 跟随符号链接，软链到普通文件（/bin/sh、Homebrew 的 zsh）照常通过。
+      if (!statSync(file).isFile()) reason = '不是普通文件'
+      else accessSync(file, constants.X_OK)
+    } catch (error) {
+      reason = String(error)
+    }
+    if (reason !== undefined) {
+      throw new Error('shell 不可执行：' + file + '（' + reason + '）'
+        + '；可在 cordis.patch.yml 里为 remote-terminal 显式配置 shellPath 指向可用的 shell')
+    }
+  }
   // 拉起外部命令时不继承 shellArgs：那批参数是交互式 shell 的语义（POSIX 的
   // `-i`、Windows 的 `-NoLogo -NoProfile`），塞给业务进程会让 `pnpm dev` 变成
   // `pnpm dev -i`。
   let args = request.args ?? (runsCommand ? [] : state.config.shellArgs)
-  if (!runsCommand && state.config.injectBashRc) {
-    const rcPath = ensureBashRc(state)
-    if (rcPath !== undefined) args = ['--rcfile', rcPath, ...args]
+  // 脱敏父环境（剔除凭据类与全部 DSH_*）：终端不继承 agent shell 的会话事实，
+  // 需要 DSH_* 的值请走 create({ env }) 注入，或在 shell 里自己显式 export。
+  const env: Record<string, string> = { ...scrubbedParentEnv(), ...request.env }
+  const wrap = runsCommand ? undefined : state.config.shellWrap
+  if (wrap !== undefined) {
+    // fish 不落盘（`-C` 内联），bash / zsh 的包装文件写在私有临时目录里。
+    const entry = wrap === 'fish' ? undefined : ensureShellWrap(state, wrap)
+    if (wrap === 'fish' || entry !== undefined) {
+      const injection = shellWrapInjection(wrap, entry, env)
+      args = [...injection.args, ...args]
+      Object.assign(env, injection.env)
+    }
   }
   // id 先于 spawn 分配：id 分配是唯一会在 spawn 之后抛出的步骤，放在前面才不会
   // 留下没人持有、也没人杀得掉的 PTY。
@@ -808,9 +1151,7 @@ function createSession(state: SharedState, request: SpawnSessionRequest): Termin
     cols: request.cols,
     rows: request.rows,
     cwd: request.cwd,
-    // 脱敏父环境（剔除凭据类与全部 DSH_*）：终端不继承 agent shell 的会话事实，
-    // 需要 DSH_* 的值请走 create({ env }) 注入，或在 shell 里自己显式 export。
-    env: { ...scrubbedParentEnv(), ...request.env },
+    env,
   })
   const session: TerminalSession = {
     id,
@@ -1100,7 +1441,9 @@ export function apply(ctx: Context, config: Config = {}): void {
   // 引用会把覆写后的结果读回来。
   const existing = sharedStateSlot()[sharedStateKey]
   const previousOwner = existing === undefined ? undefined : { ctx: existing.ctx, config: existing.config }
-  const state = acquireSharedState(ctx, resolveConfig(config))
+  const resolved = resolveConfig(config)
+  const state = acquireSharedState(ctx, resolved)
+  if (resolved.shellWarning !== undefined) warn(state, resolved.shellWarning)
   try {
     // 对外服务：别的插件用它把长驻进程放进终端（服务随本 fiber 卸载而注销）。
     new TerminalSessionsService(ctx, state)

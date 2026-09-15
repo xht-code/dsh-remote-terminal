@@ -1,10 +1,14 @@
 # bundle patch 层：向 profile 插入本插件入口行。
-# 启用后无需配置；可选覆盖项见 src/index.ts 的 Config（shellPath/shellArgs/
-# maxSessions/scrollbackMaxBytes/wsPath），示例：
+# 启用后无需配置：终端用账户里的登录 shell（chsh 的结果——macOS 默认 /bin/zsh、
+# Linux 常见 /bin/bash，fish 亦可），先加载你自己的 shell 配置再注入 cwd 上报钩子。
+# 可选覆盖项见 src/index.ts 的 Config（shellPath/shellArgs/maxSessions/
+# maxSessionsTotal/scrollbackMaxBytes/wsPath），示例：
 #
 # - id: remote-terminal
 #   config:
-#     shellPath: /usr/bin/zsh
+#     maxSessions: 6
+#
+# 注意：显式写 shellPath / shellArgs 就不再注入钩子（终端标签不再随 cd 更新）。
 
 - insert:
     - id: remote-terminal

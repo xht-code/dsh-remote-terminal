@@ -25,7 +25,7 @@ function check(label, ok, detail = '') {
 }
 
 /**
- * tmpdir 下本插件命名的 bash rc 私有目录集合。
+ * tmpdir 下本插件命名的 shell 包装私有目录集合。
  * 返回集合而非单值：同机上可能另有正在运行的 dsh web 实例持有自己的目录，
  * 断言必须只针对本进程新增的那个，否则会被外来目录污染。
  */
@@ -142,18 +142,20 @@ await new Promise((resolve, reject) => {
     if (msg.type === 'attached') {
       check('attach 应答含终端 id 与 token', msg.token === 't1' && typeof msg.terminalId === 'string', `${msg.terminalId} token=${msg.token}`)
       // rc 包装写在 0700 私有目录内：共享 /tmp 下不可预测、不可被他人预置软链。
+      // 登录 shell 为 fish 时不落盘、一个目录都不建（钩子经 --init-command 内联注入），
+      // 因此这里只要求"至多一个、存在即 0700"。
       const own = ownRcDirs()
       const mode = own.length === 1 ? statSync(own[0]).mode & 0o777 : 0
-      check('bash rc 目录为私有 0700', own.length === 1 && mode === 0o700, own.length + ' 个，0o' + mode.toString(8))
+      check('shell 包装目录至多一个且为私有 0700', own.length <= 1 && (own.length === 0 || mode === 0o700), own.length + ' 个，0o' + mode.toString(8))
       sessionId = msg.terminalId
     } else if (msg.type === 'output') {
       // PTY 输出按任意边界分块，累积后再做包含匹配。
       accumulated += msg.data
       if (!greeted && accumulated.includes('\x1b]7;file:')) {
-        // 首个提示符携带 bash rc 钩子注入的 OSC 7：确认钩子生效后再发命令，
+        // 首个提示符携带 shell 包装钩子注入的 OSC 7：确认钩子生效后再发命令，
         // 避免 PTY 的输入回显先于提示符到达导致误判。
         greeted = true
-        check('bash rc 钩子输出 OSC 7 cwd 序列', true, accumulated.split('\n')[0])
+        check('shell 包装钩子输出 OSC 7 cwd 序列', true, accumulated.split('\n')[0])
         client.send(JSON.stringify({ type: 'input', terminalId: sessionId, data: 'echo hello-pty\n' }))
       } else if (greeted && !echoed && accumulated.includes('hello-pty')) {
         echoed = true
@@ -329,7 +331,7 @@ await new Promise((resolve, reject) => {
   ctx._disposers[0]()
   check('装配失败后引用仍能归零（无泄漏）', fakeWebServer.registered.length === 0,
     '剩余路由 ' + fakeWebServer.registered.length + ' 条')
-  check('卸载后 bash rc 私有目录已清理', ownRcDirs().length === 0, ownRcDirs().join(', '))
+  check('卸载后 shell 包装私有目录已清理', ownRcDirs().length === 0, ownRcDirs().join(', '))
 }
 
 httpServer.close()

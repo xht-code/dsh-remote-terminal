@@ -30,7 +30,7 @@ DSH 的 Web GUI 只提供模型会话视图（聊天 / 轨迹），没有面向�
 | :-- | :-- |
 | 宿主运行时 | 跟随 `dsh web` 的 Node.js（开发与验证使用 Node 24）；本包 `engines` 声明 `>=20` |
 | DSH | 已在 `0.1.5-rc.1` 上实测；运行时依赖 `@deepseek-ai/cordis`、`@deepseek-ai/dsh-subprocess`、`@deepseek-ai/schemastery` 由宿主提供 |
-| shell | Linux / macOS 默认交互式 bash（注入 OSC 7 钩子以实时跟随目录）；Windows 走 PowerShell（不注入钩子，目录不实时跟随） |
+| shell | Linux / macOS 都用**账户里的登录 shell**（Linux 上通常是 bash，macOS 默认 zsh；fish 亦可）：先加载你自己的配置再注入 OSC 7 钩子以实时跟随目录（macOS 的 zsh / fish 按登录 shell 启动，`~/.zprofile` 与 macOS 的 `/etc/paths.d` PATH 构造都会生效）；Windows 走 PowerShell（不注入钩子，目录不实时跟随） |
 | 浏览器 | 支持 WebSocket 的现代浏览器；xterm.js 及其样式随 bundle 打包，无需额外静态资源 |
 | 反向代理 | 经代理访问需透传 WebSocket `Upgrade`（见「常见问题」） |
 
@@ -71,7 +71,7 @@ pnpm dev    # 可选：tsdown --watch；产物变化会被宿主热重载感知
 
 **宿主半体**（`lib/index.mjs`）：
 - 在 `webServer` 注册 WebSocket 升级路由（默认 `/api/remote-terminal/ws`），握手先过 `connection.requestRejection` 的信任围栏与浏览器认证，未认证一律拒绝；
-- 用 **node-pty** 为每个会话启动一个交互 shell（默认 `/bin/bash --rcfile <生成的包装 rc> -i`，先加载用户 rc 配置再注入 `PROMPT_COMMAND` 钩子，于每个提示符前输出 OSC 7 上报 cwd；Windows 为 PowerShell），环境经 `scrubbedParentEnv()` 清洗（不泄漏凭据类变量；`DSH_*` 一并剔除，见「`DSH_*` 环境变量」）；
+- 用 **node-pty** 为每个会话启动一个交互 shell：Linux / macOS 都是**账户里的登录 shell**（`chsh` 的结果；查不到时退回 macOS `/bin/zsh`、其余 `/bin/bash`），Windows 是 PowerShell。cwd 上报钩子按 shell 类型注入，三者都**先让用户自己的配置生效**再挂钩子，于每个提示符前输出 OSC 7：bash 用 `--rcfile`（先 source `~/.bashrc`，再挂 `PROMPT_COMMAND`）、zsh 用 `ZDOTDIR`（先 source `~/.zshenv` / `~/.zprofile` / `~/.zshrc`，再挂 `precmd`）、fish 用 `--init-command`（它在用户的 `config.fish` 之后执行，只需挂一个 `fish_prompt` 事件函数；主机名用 fish 的 `$hostname` 保留变量，不依赖外部命令）。macOS 下 zsh / fish 按 `-l -i` 起**登录** shell，与 Terminal.app / iTerm2 一致（bash 见「限制」）。环境经 `scrubbedParentEnv()` 清洗（不泄漏凭据类变量；`DSH_*` 一并剔除，见「`DSH_*` 环境变量」）；
 - 会话按 id 登记（id 为随机串，不做递增序号，避免宿主重启后旧 id 命中新会话）：支持同一浏览器连接**同时挂接多个会话**（多终端标签）；输出经环形缓冲（默认 2 MiB）保留，向所有挂接的客户端广播；退出后会话保留可重连回看，close 销毁时通知全部挂接者；
 - 会话独立于浏览器连接保活：刷新页面 / 断线重连后重新 attach 已记录的会话集合；每条输出带**绝对偏移**（`output.offset`），客户端重挂时把已消费到的位置作为 `attach.since` 报回来，宿主**只补缺口**、不重放头部，一次 attach 的重放发完会补一个 `synced` 标记（`synced.offset` 即客户端当前所处位置）；不同标签页可同时挂接同一终端；
 - 客户端报的 `since` 早于重放缓冲还留着的位置时（缓冲被裁剪过），宿主把还留着的内容全部重放，而不是当作"已消费"整段跳过：被裁掉的那段补不回来，但客户端不会因此把没收到过的内容记成已有；
@@ -86,7 +86,7 @@ pnpm dev    # 可选：tsdown --watch；产物变化会被宿主热重载感知
 - **终端实例活在视图之外**：DSH 的会话视图区只渲染当前激活的那个 view，切到轨迹再切回来组件是真的卸载重挂；xterm 实例、标签集合与 WebSocket 连接因此按**作用域**登记在视图之外的运行时里（`client/runtime`），切走只摘 DOM、切回原样贴回——终端画面、滚动位置与运行中的进程都不受影响，也不会因为一次视图切换就重放历史。**页内切换视图（页面仍可见）不再释放连接**：切回来零补发，TUI 程序（lazygit、vim 等）不会因为一次切换就重画一遍；只有页面真的被隐藏（切到浏览器其他标签页、最小化）才开始 60 秒宽限计时，到期释放连接，让宿主把无人挂接的会话按闲置回收（没有终端实例时立即释放）。代价是页内切走的连接会一直保持到页面被隐藏或视图回挂——该会话在此期间不会被宿主当闲置回收，配额吃紧时可以关掉它或调大 `maxSessions`；
 - 视图用 **xterm.js**（随 bundle 打包）：页内以**标签栏管理多个终端**，「+」新建会话、标签 ✕ 销毁会话，每个标签独立 xterm 实例；输出直写 xterm、输入经 WebSocket 上行（超过 32 KiB 的粘贴自动分帧，不会撞上宿主单帧上限）；`ResizeObserver` + `FitAddon` 跟随容器尺寸，`onResize` 同步 PTY 尺寸；切换标签时补一次 fit（隐藏容器的尺寸无法测量，FitAddon 会跳过，不补则滞留旧尺寸）；
 - 新建会话**先挂载 xterm、下一帧按实测尺寸 attach**：会话若先按默认 80×24 起 shell 再被 resize，窄屏上 readline 的重绘会和 xterm 的重排叠加，把提示符留成两条；
-- **标签显示当前目录最后一段（如 myproj）并随 `cd` 实时更新**（解析 bash 钩子输出的 OSC 7）；状态条显示完整路径与会话 id；
+- **标签显示当前目录最后一段（如 myproj）并随 `cd` 实时更新**（解析 shell 钩子输出的 OSC 7）；状态条显示完整路径与会话 id；
 - **终端按工作区分组**：每个工作区各有一组终端，标签、刷新恢复、重连都只在本工作区内；会话所属工作区取侧边栏分组的同一判定（工作区行账目上的 `sessionIds`），未归属任何工作区的会话共用一个 default 组，工作区注册表还没就绪时不建会话（避免把终端记到错误的组里）；
 - **重挂只补缺口，重建才重放**：重连时按已消费偏移报 `since`，宿主只补缺口，并按当前尺寸补报一次 PTY 尺寸（断线期间的窗口缩放不会让 PTY 与视图尺寸脱节）；全新客户端（刷新页面、新浏览器标签页）没有画面可续，只能整段重放——重放期间终端先遮住，等 xterm 把排队的输出解析完（`synced`）再一次性显示当前画面，用户看到的是"终端还在那儿"，而不是历史又跑了一遍；重放中掉线也不会把没到手的内容记成已有：位置只随真正收到的输出帧推进；
 - **失效会话的标签亮明原因，且不再持有失效 id**：会话被宿主回收后标签落地为错误态，输入与 resize 不再发往一个已经不存在的会话，该 id 也从本地登记里剔除、重连不会反复重试；关掉这个标签再点「+」即可拿到新终端；
@@ -100,14 +100,16 @@ pnpm dev    # 可选：tsdown --watch；产物变化会被宿主热重载感知
 
 | 字段 | 默认 | 说明 |
 | :-- | :-- | :-- |
-| `shellPath` | 按平台（bash / powershell.exe） | 终端 shell 可执行文件 |
-| `shellArgs` | 按平台（`-i` 等） | shell 启动参数 |
+| `shellPath` | 账户里的登录 shell（查不到时 macOS `/bin/zsh`、其余 `/bin/bash`）；Windows 默认 `powershell.exe` | 终端 shell 可执行文件 |
+| `shellArgs` | 跟着实际要跑的 shell 算：`-i`；macOS 的 zsh / fish 为 `-l -i`；Windows 只有 PowerShell 才是 `-NoLogo -NoProfile` | shell 启动参数。显式指定 `shellPath` 或 `shellArgs` 后**不再注入 cwd 钩子**（标签与状态条停留于打开时的目录） |
 | `maxSessions` | `8` | 每个工作区的终端会话上限（按作用域分别计算） |
 | `maxSessionsTotal` | `32` | 全部工作区合计的终端会话总数上限（兜底；应不小于 `maxSessions`） |
 | `scrollbackMaxBytes` | `2 * 1024 * 1024` | 每会话重放缓冲字节上限 |
 | `wsPath` | `/api/remote-terminal/ws` | WebSocket 升级路由。**自定义需同时改客户端常量**：浏览器半体读不到宿主配置，只连 `protocol.ts` 里的 `DEFAULT_WS_PATH`；只改这里会让终端一直停在「连接中」 |
 
 单帧上限（1 MiB）与单连接发送缓冲阈值（4 MiB 与 `scrollbackMaxBytes` 的 8 倍取大）是内部常量，不开放配置。
+
+> **登录 shell（Linux / macOS）**：默认终端就是你平时用的那个 shell——账户里的登录 shell（`chsh` 的结果），因此 `~/.bashrc`、`~/.zshenv` / `~/.zprofile` / `~/.zshrc`、oh-my-zsh / prezto / starship 等照常加载；macOS 上 Apple 那条 "The default interactive shell is now zsh" 提示也不会再出现。**macOS 的 zsh / fish 按登录 shell 启动**（`-l -i`，与本机 Terminal.app / iTerm2 一致）：zsh 的 `~/.zprofile`（Homebrew `brew shellenv` 的常规落点）与 fish 的登录分支（按 macOS 的 `/etc/paths`、`/etc/paths.d` 构造 PATH）都只有登录 shell 才会执行；Linux 的 GUI 终端（GNOME Terminal / Konsole）是非登录交互 shell，保持一致。cwd 钩子的注入方式因 shell 而异：bash 用 `--rcfile`；zsh 没有 `--rcfile`，改用 `ZDOTDIR` 指向 0700 私有包装目录（回源 `.zshenv` / `.zprofile` 时先把 `ZDOTDIR` 交给你、回源后采纳你改过的新值再交还包装目录，所以把配置放 `~/.config/zsh` 的写法照常生效；回源 `.zshrc` 前则会还原成你的原值，prezto / zim 这类读 `$ZDOTDIR` 的框架照常工作）；fish 用 `--init-command`（本仓库在 fish 3.7 上实测），它在用户的 `config.fish` 之后执行，因此不需要回源任何配置。终端里起的子进程看到的都是正常环境。账户查不到（例如容器里 uid 不在 `/etc/passwd`）时会退回平台默认并打一条日志；想固定用别的 shell，就在 `cordis.patch.yml` 里显式写 `shellPath`。
 
 在用户层 `cordis.patch.yml` 里覆盖（示例）：
 
@@ -157,7 +159,7 @@ ctx.terminalSessions.close(sessionId)             // true=确实关掉了一个�
 - 这类会话标记为 `external`：**不占用手工终端的 `maxSessions` 配额**（否则拉几个服务
   就会把用户的终端额度吃光），但仍受跨工作区的 `maxSessionsTotal` 兜底，且**配额吃紧
   时同样会被当作闲置会话回收**——持有方只能靠 `describe()` 发现会话已消失；
-- 传了 `command` 就不套 bash rc 包装，也**不继承**配置里的 `shellArgs`：那批参数是
+- 传了 `command` 就不套 shell 包装，也**不继承**配置里的 `shellArgs`：那批参数是
   交互式 shell 的语义（POSIX 的 `-i`、Windows 的 `-NoLogo -NoProfile`），塞给
   `pnpm dev` 会变成非法参数。要传参数请显式给 `args`；
 - 服务随本插件的 fiber 卸载而注销，调用方用 `ctx.inject(['terminalSessions'], …)`
@@ -210,7 +212,12 @@ pnpm build             # 产出 lib/index.mjs（宿主）+ lib/client.js（客�
 pnpm dev               # tsdown --watch，配合 link: 安装做本地调试
 pnpm typecheck         # 宿主 / 客户端 / 测试三层类型检查
 pnpm test              # 单元测试（vitest）：协议解析与粘贴分片、标签与 OSC 7 解析、
-                       #   配置归一化、会话分桶、配额回收（分区 + 总数兜底）、输出背压、
+                       #   配置归一化与默认 shell 解析（含账户查不到时的退路、钉了 shellPath 时的
+                       #   平台默认参数、空串 / YAML 空值）、shell 不可执行时的报错、shell 包装脚本
+                       #   （有 zsh / fish 时按插件真实的 argv / env 喂给真实 shell，并在真实 PTY
+                       #   里验证提示符上报与 cd 跟随；包装目录被外部清理后会重建）、会话分桶、
+                       #   配额回收（分区 + 总数兜底）、
+                       #   输出背压、
                        #   对外会话服务（拉起 / 配额隔离 / close 语义 / env 注入 /
                        #   总数吃紧时的清理与回收 / 错误分支）、会话快照对账判定、
                        #   输出偏移与 since 增量续接（含缓冲裁剪后的重放起点）、
@@ -222,7 +229,9 @@ pnpm test:integration  # 集成验证：构建后以假上下文装配插件，�
 pnpm test:heartbeat    # 心跳回收验证（较慢，约 60–90s）：半开连接被终止且配额释放
 ```
 
-集成验证覆盖：握手认证拒绝、attach 与 token 回显、PTY 交互与 OSC 7 上报、退出会话重连与重放、多会话挂接与 close 销毁、失效会话报错、rc 临时目录私有性（0700）与卸载清理。
+> 宿主半体另外导出 `defaultShell` / `resolveConfig` / `shellWrapFiles` / `shellWrapInjection` / `FISH_INIT_COMMAND` / `releaseSharedState`：它们是宿主内部的决策与产物，导出只为让单测与集成脚本拿**真实**的 argv / env / 包装文件去验证（而不是照抄一份），不构成对外契约。
+
+集成验证覆盖：握手认证拒绝、attach 与 token 回显、PTY 交互与 OSC 7 上报、退出会话重连与重放、多会话挂接与 close 销毁、失效会话报错、shell 包装临时目录私有性（0700）与卸载清理。
 
 ## 验证
 
@@ -239,7 +248,10 @@ pnpm test:heartbeat    # 心跳回收验证（较慢，约 60–90s）：半开�
 - **适用**：`dsh web` 部署在服务器 / 无头机上、浏览器从其它设备访问的场景；终端即宿主 shell 全权限（等效 SSH）。
 - **限制**：
   - 浏览器载入的 WebSocket 不支持时终端不可用（现代浏览器均支持）；经反向代理访问需代理支持 WebSocket `Upgrade`；
-  - **cwd 实时跟随仅在默认 bash 下生效**（自定义 `shellPath` / `shellArgs` 时不注入钩子，标签与状态条保持打开时的目录）；
+  - **cwd 实时跟随只在默认 shell 下生效**（登录 shell 为 bash / zsh / fish 时注入钩子）：显式指定 `shellPath` / `shellArgs`，或登录 shell 认不出（sh、nu、nologin 等）时不注入钩子，标签与状态条保持打开时的目录；
+  - **bash 不加载登录文件**（`/etc/profile`、`~/.bash_profile`、`~/.bash_login`、`~/.profile`）：`--rcfile` 与 `-l` 互斥（实测 `-l` 下 rcfile 不执行，把 `-l` 放在 `--rcfile` 前还会直接报无效选项），而 cwd 钩子只能靠 `--rcfile` 注入。只把 PATH 写在 `~/.bash_profile` 的 bash 用户请在 `~/.bashrc` 里也放一份；macOS 默认登录 shell 是 zsh，zsh 侧已按登录 shell 启动，不受此限；
+  - 登录 shell 是 `nologin` / `/bin/false` 这类"不可登录"程序时（服务账户的常见加固），终端会**照实拉起它并立即退出**——与 SSH 语义一致；要绕过请在 `cordis.patch.yml` 里显式写 `shellPath`；
+  - 登录 shell **已被卸载、路径指向目录**等明显不可用时，新建终端会明确报错并提示可显式配置 `shellPath`（而不是给一个一闪就退的终端）。这个预判只覆盖 POSIX 的绝对路径：相对路径与裸名要按子进程的 cwd / PATH 解析，词法预判会误杀能跑的配置，故不预判；
   - 会话是**宿主进程级**的：`dsh web` 重启后全部消失；
   - 断线或离开视图期间产生的输出超出重放缓冲（默认 2 MiB，从头滚掉的部分不再保留）时，缺口补不回来：续接的终端会从缓冲还留着的位置接着长，中间少一段（少掉的正是被裁掉的那一段，客户端已经持有的内容不会被重发），并在接缝处**写一行可见提示**说明缺少多少字节，而不是静默跳段；刷新页面则是整段重建，同样只拿得到缓冲里的内容；
   - 宿主半体不随浏览器热重载（DSH 只轮询 `lib/client.js`）：更新插件后请重启 `dsh web`，让两端来自同一份构建；两端协议不一致时终端可能停在空白画面（例如浏览器半体已更新、宿主仍是很早以前的版本），重启宿主即可恢复；
