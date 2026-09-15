@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-terminal",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DSH (DeepSeek Harness) 插件：在 Web GUI 会话视图栏（轨迹旁）增加完整交互式终端 tab，远程浏览器经 WebSocket 直连宿主 PTY shell",
   "keywords": [
     "dsh",

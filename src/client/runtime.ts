@@ -488,7 +488,11 @@ export class ScopeRuntime {
     if (this.mounted.has(key)) return
     const holder = document.createElement('div')
     holder.className = 'dsh-rt-term'
-    holder.style.cssText = 'position:absolute;inset:0;padding:0 12px 12px;'
+    // 面板的子元素而非绝对定位覆盖层：面板底部按输入框高度留出内边距后，容器随内容盒一起
+    // 收窄，让出来的高度直接变成 xterm 的可用行数——若把容器钉在面板的填充盒上，那段让位
+    // 只会变成容器与输入框之间的空白，终端反而少了几行。border-box 让容器自带的内边距算在
+    // 这份高度之内，否则容器会撑出面板内容盒、把终端压回输入框底下。
+    holder.style.cssText = 'box-sizing:border-box;width:100%;height:100%;padding:0 12px 12px;'
     const terminal = new Terminal({
       fontFamily: readCodeFontFamily(),
       fontSize: 13,

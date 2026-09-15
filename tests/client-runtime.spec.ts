@@ -100,6 +100,8 @@ const fakes = vi.hoisted(() => {
       /** 宿主当前的主题与代码字体：用例可改写以模拟切换。 */
       theme: { background: '#000' } as Record<string, unknown>,
       fontFamily: 'monospace',
+      /** FitAddon.fit 的调用次数：面板内容盒变化必须收敛成一次重排。 */
+      fits: 0,
     },
   }
 })
@@ -141,7 +143,9 @@ vi.mock('@xterm/xterm', () => ({
 
 vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
-    fit(): void {}
+    fit(): void {
+      fakes.state.fits += 1
+    }
   },
 }))
 
@@ -269,6 +273,7 @@ function sentOfType<T extends ClientMessage['type']>(connection: FakeConnection,
 beforeEach(() => {
   fakes.state.connections.length = 0
   fakes.state.terminals.length = 0
+  fakes.state.fits = 0
   frames.clear()
   nextFrameId = 1
   vi.useFakeTimers()
@@ -325,6 +330,23 @@ describe('终端运行时', () => {
     // 同一个 holder 贴到新面板上：终端实例与画面都没重建。
     expect(holderOf(second)).toBe(holder)
     expect(holderOf(second).style.display).toBe('')
+  })
+
+  it('面板内容盒变化时重排全部已挂载终端', () => {
+    // 视图把面板的 ResizeObserver 接到这个入口；输入框长高改的是面板 padding，观察
+    // content-box 同样会通知。这条路径断掉的话，让位变了终端却不重排，最后一行会被输入框盖住。
+    const runtime = runtimeFor('workspace:refit')
+    runtime.attachPanel(createPanel(), () => '/srv/app')
+    const connection = lastConnection()
+    connection.open()
+    replyAttached(connection, 'term-1', { data: 'hello' })
+    lastTerminal().flush()
+    flushFrames()
+    const before = fakes.state.fits
+
+    runtime.fitAll()
+
+    expect(fakes.state.fits).toBe(before + 1)
   })
 
   it('重放期间先遮住画面，输出解析完才显示', () => {

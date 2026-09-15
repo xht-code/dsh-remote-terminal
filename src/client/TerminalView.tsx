@@ -9,6 +9,10 @@
  * 会话集合按**工作区**（作用域）分桶：标签、恢复与配额都只作用于当前工作区，
  * 切到别的工作区看到的是那一组终端（见 sessions 模块与 protocol 的 scope 约定）。
  *
+ * 面板以宿主的「输入框覆盖层」方式占满会话视图区（见根节点上的
+ * `data-conversation-composer-overlay`）：输入框浮在终端之上，终端吃到完整高度，
+ * 底部再按宿主发布的输入框高度让位（见面板样式）。
+ *
  * @module dsh-remote-terminal/client-view
  */
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
@@ -118,11 +122,18 @@ const addButtonStyle: CSSProperties = {
   cursor: 'pointer',
 }
 
-/** 终端面板：绝对定位叠放多个 xterm 容器，仅激活标签可见。 */
+/**
+ * 终端面板：承载 xterm 容器（由运行时按标签挂入，非激活标签不占位）。
+ *
+ * 底部内边距用宿主发布的 `--dsh-composer-height` 让位（宿主会话布局观察输入框席位后写在
+ * 滚动体上）：本视图声明为输入框覆盖层，输入框浮在面板之上，不留这段内边距终端最后一行
+ * 就被压在输入框底下。输入框长高会改变本面板的内容盒，由下面的 ResizeObserver 触发重排。
+ */
 const panelStyle: CSSProperties = {
   position: 'relative',
   flex: 1,
   minHeight: 0,
+  paddingBottom: 'var(--dsh-composer-height, 152px)',
 }
 
 /**
@@ -166,7 +177,8 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
     return () => runtime.detachPanel()
   }, [runtime])
 
-  // 面板尺寸变化时对所有已挂载终端重新 fit。
+  // 面板内容盒变化时对所有已挂载终端重新 fit：窗口缩放、输入框长高（底部让位改的是
+  // padding，ResizeObserver 观察 content-box，故同样会通知）都在这里收敛成一次重排。
   useEffect(() => {
     const panel = panelRef.current
     if (runtime === undefined || panel === null) return
@@ -191,7 +203,13 @@ export function TerminalView({ sessionId, useWorkspaces, t }: TerminalViewProps)
   const activeTab = state.tabs.find(tab => tab.key === state.activeKey) ?? state.tabs[0] ?? null
 
   return (
-    <div style={rootStyle}>
+    <div
+      style={rootStyle}
+      // 声明本视图是"输入框覆盖层"：宿主据此让输入框浮在视图之上（与轨迹视图同一机制），
+      // 并撤掉那对贯穿全高的左右宽度把手——它们 z-index 高于视图，会盖住终端右侧的
+      // 拖拽选区，还会把点击吃成把手拖拽。
+      data-conversation-composer-overlay=""
+    >
       <div style={tabRowStyle}>
         {state.tabs.map(tab => (
           <div

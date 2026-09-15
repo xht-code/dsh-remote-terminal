@@ -55,11 +55,7 @@ export const inject = ['slots', 'locale'] as const
 
 /** 终端视图自身的布局样式（xterm 官方 CSS 随 bundle 注入）。 */
 const VIEW_CSS = [
-  '.dsh-rt-term {',
-  '  flex: 1;',
-  '  min-height: 0;',
-  '  padding: 0 12px 12px;',
-  '}',
+  // 容器尺寸由 mountTerminal 落成内联样式（随视图保活，不经过 React 渲染）。
   '.dsh-rt-term .xterm {',
   '  height: 100%;',
   '}',
