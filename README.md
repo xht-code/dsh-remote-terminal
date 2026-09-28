@@ -29,7 +29,7 @@ DSH 的 Web GUI 只提供模型会话视图（聊天 / 轨迹），没有面向�
 | 项 | 要求 |
 | :-- | :-- |
 | 宿主运行时 | 跟随 `dsh web` 的 Node.js（开发与验证使用 Node 24）；本包 `engines` 声明 `>=20` |
-| DSH | 已在 `0.1.5-rc.1` 上实测；运行时依赖 `@deepseek-ai/cordis`、`@deepseek-ai/dsh-subprocess`、`@deepseek-ai/schemastery` 由宿主提供 |
+| DSH | 已在 `0.1.7-rc.2` 上实测（19 个测试文件、151 项用例与宿主半体验证脚本全部通过）；运行时依赖 `@deepseek-ai/cordis`、`@deepseek-ai/dsh-subprocess`、`@deepseek-ai/schemastery` 由宿主提供。`dsh-subprocess` 自 0.1.7 起新增 `@deepseek-ai/dsh-http-proxy` peer，同样由宿主提供；插件 devDependencies 中显式声明它，否则本包自己的 `pnpm install`（`autoInstallPeers: false`）解析不到该 peer，测试与构建会整片失败 |
 | shell | Linux / macOS 都用**账户里的登录 shell**（Linux 上通常是 bash，macOS 默认 zsh；fish 亦可）：先加载你自己的配置再注入 OSC 7 钩子以实时跟随目录（macOS 的 zsh / fish 按登录 shell 启动，`~/.zprofile` 与 macOS 的 `/etc/paths.d` PATH 构造都会生效）；Windows 走 PowerShell（不注入钩子，目录不实时跟随） |
 | 浏览器 | 支持 WebSocket 的现代浏览器；xterm.js 及其样式随 bundle 打包，无需额外静态资源 |
 | 反向代理 | 经代理访问需透传 WebSocket `Upgrade`（见「常见问题」） |
